@@ -14,6 +14,15 @@ if (-not $Dest) {
 $src = Join-Path $repo 'packaging\nil'
 Set-Location $repo
 
+# Source paths end up in nil.exe's panic messages; replace this machine's folders
+# (which name the user and the repo) with neutral ones. Unit-separated, so paths
+# with spaces survive.
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
+$env:CARGO_ENCODED_RUSTFLAGS = @(
+    "--remap-path-prefix=$cargoHome=cargo"
+    "--remap-path-prefix=$repo=nil"
+) -join [char]0x1f
+
 cargo build --release -p bp-gui
 if ($LASTEXITCODE -ne 0) { throw 'The build failed.' }
 
