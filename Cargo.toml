@@ -4,7 +4,7 @@ members = ["crates/bp-core", "crates/bp-decode", "crates/bp-output", "crates/bp-
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.1.1"
 
 [workspace.dependencies]
 symphonia = { version = "0.6.1", default-features = false, features = ["flac", "pcm", "wav", "aiff", "alac", "aac", "isomp4"] }

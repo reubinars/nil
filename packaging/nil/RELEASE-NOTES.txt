@@ -1,6 +1,16 @@
 nil release notes
 =================
 
+0.1.1
+-----
+
+- The library keeps itself up to date: music added to or removed from your
+  music folders shows up a few seconds after the copy finishes, without
+  pressing Rescan. Only the changed files are read.
+- Only one nil runs at a time. Starting it again brings the open window to
+  the front, restoring it if it was minimized.
+- nil.exe no longer contains folder paths from the machine it was built on.
+
 0.1.0 — first release
 ---------------------
 

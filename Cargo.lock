@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "bp-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bp-core",
  "bp-decode",
@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "bp-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -563,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "bp-decode"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bp-core",
  "bp-decode",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "bp-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bp-core",
  "bp-decode",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "bp-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bp-core",
  "bp-decode",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "bp-output"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bp-core",
  "rtrb",

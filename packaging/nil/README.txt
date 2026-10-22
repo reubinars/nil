@@ -1,4 +1,4 @@
-nil 0.1.0
+nil 0.1.1
 =========
 
 nil is a bit-perfect music player for Windows. It sends your files to your DAC
@@ -13,7 +13,8 @@ GETTING STARTED
 2. On the first run, click "Add music folder" and pick the folder that holds
    your music. nil reads the folder (about half a minute for ~2,700 files) and
    shows your albums. Later launches open instantly and look for changes in
-   the background.
+   the background. While nil is open, music you add to or remove from the
+   folder shows up a few seconds after the copy finishes.
 3. Open an album and double-click a track to play it.
 
 To keep nil handy, right-click nil.exe (or nil on the taskbar while it runs)
@@ -53,7 +54,8 @@ Alt+Left / Right    Back / forward, like a browser
 Mouse back/forward  Back / forward
 
 The window: drag the empty part of the top bar to move it, double-click it
-to maximize, and drag any edge to resize.
+to maximize, and drag any edge to resize. Only one nil runs at a time:
+starting it again brings the open window to the front.
 
 
 WHAT IT PLAYS
