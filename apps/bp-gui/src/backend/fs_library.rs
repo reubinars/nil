@@ -2,18 +2,21 @@
 //! first scan (empty index) publishes a partial `LibraryIndex` every second; later
 //! scans publish only progress until the full index replaces the old one at the end.
 //! The last scan is saved to `library-cache.json`: it is shown at launch, and a rescan
-//! only re-reads files whose size or modified time changed.
+//! only re-reads files whose size or modified time changed. Once `watch` is called,
+//! changes in the music folders start a rescan by themselves.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 use lofty::picture::PictureType;
 use lofty::prelude::*;
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::cache::{self, CachedFile, Entry};
@@ -33,6 +36,9 @@ const ART_NAMES: [&str; 5] = [
     "cover.png",
 ];
 const PUBLISH_EVERY: Duration = Duration::from_secs(1);
+/// How long the music folders must be quiet after a change before the rescan starts,
+/// so a folder being copied in is scanned once, at the end.
+const WATCH_QUIET: Duration = Duration::from_secs(2);
 const PANIC_REASON: &str = "reading the file crashed the decoder";
 
 #[derive(Serialize, Deserialize, Default)]
@@ -53,10 +59,21 @@ struct Shared {
     unreadable: Mutex<Vec<(PathBuf, String)>>,
     /// Bumped by every `rescan`; a scan thread whose generation is stale stops publishing.
     generation: AtomicU64,
+    /// Bumped by every finished scan.
+    revision: AtomicU64,
+    waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 pub struct FsLibrary {
     shared: Arc<Shared>,
+    watching: Mutex<Option<Watching>>,
+}
+
+struct Watching {
+    watcher: RecommendedWatcher,
+    /// The folders being watched; one that couldn't be (a disconnected drive) is not
+    /// listed, so the next `rescan` tries it again.
+    folders: Vec<PathBuf>,
 }
 
 impl FsLibrary {
@@ -103,7 +120,55 @@ impl FsLibrary {
                 status: Mutex::new(status),
                 unreadable: Mutex::new(unreadable),
                 generation: AtomicU64::new(0),
+                revision: AtomicU64::new(0),
+                waker: Mutex::new(None),
             }),
+            watching: Mutex::new(None),
+        }
+    }
+
+    /// Rescans by itself once the music folders have been quiet for a moment after a
+    /// change to their audio files, folder art or subfolders. Without a file watcher
+    /// (the system refused one), only `rescan` scans.
+    pub fn watch(&self) {
+        self.watch_with(WATCH_QUIET);
+    }
+
+    fn watch_with(&self, quiet: Duration) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            // An error (such as an overflowed event buffer) may hide changes.
+            if event.map_or(true, |e| affects_library(&e)) {
+                let _ = tx.send(());
+            }
+        });
+        let Ok(watcher) = watcher else {
+            return;
+        };
+        let shared = Arc::downgrade(&self.shared);
+        std::thread::spawn(move || rescan_when_quiet(&rx, &shared, quiet));
+        *self.watching.lock().unwrap() = Some(Watching {
+            watcher,
+            folders: Vec::new(),
+        });
+        self.update_watches();
+    }
+
+    /// Watches the folder list as it is now.
+    fn update_watches(&self) {
+        let mut watching = self.watching.lock().unwrap();
+        let Some(w) = watching.as_mut() else {
+            return;
+        };
+        let folders = self.folders();
+        for f in w.folders.iter().filter(|f| !folders.contains(f)) {
+            let _ = w.watcher.unwatch(f);
+        }
+        w.folders.retain(|f| folders.contains(f));
+        for f in folders {
+            if !w.folders.contains(&f) && w.watcher.watch(&f, RecursiveMode::Recursive).is_ok() {
+                w.folders.push(f);
+            }
         }
     }
 
@@ -198,11 +263,8 @@ impl LibrarySource for FsLibrary {
     }
     /// Returns immediately; the scan runs on its own thread, replacing any running one.
     fn rescan(&self) {
-        let gen_ = self.shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.shared.status.lock().unwrap() = ScanStatus::Scanning { done: 0, total: 0 };
-        let shared = self.shared.clone();
-        let folders = self.folders();
-        std::thread::spawn(move || scan_with(&shared, gen_, &folders, worker_count(), probe));
+        self.update_watches();
+        start_scan(&self.shared);
     }
     fn scan_status(&self) -> ScanStatus {
         self.shared.status.lock().unwrap().clone()
@@ -210,6 +272,58 @@ impl LibrarySource for FsLibrary {
     fn unreadable(&self) -> Vec<(PathBuf, String)> {
         self.shared.unreadable.lock().unwrap().clone()
     }
+    fn revision(&self) -> u64 {
+        self.shared.revision.load(Ordering::SeqCst)
+    }
+    fn set_waker(&self, waker: Box<dyn Fn() + Send + Sync>) {
+        *self.shared.waker.lock().unwrap() = Some(Arc::from(waker));
+    }
+}
+
+/// Starts a scan of the folder list on its own thread, replacing any running one.
+fn start_scan(shared: &Arc<Shared>) {
+    let gen_ = shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    *shared.status.lock().unwrap() = ScanStatus::Scanning { done: 0, total: 0 };
+    wake(shared);
+    let folders = shared.folders.lock().unwrap().clone();
+    let shared = shared.clone();
+    std::thread::spawn(move || scan_with(&shared, gen_, &folders, worker_count(), probe));
+}
+
+fn wake(shared: &Shared) {
+    let waker = shared.waker.lock().unwrap().clone();
+    if let Some(waker) = waker {
+        waker();
+    }
+}
+
+/// Starts a scan after each burst of `changes`, once none has come for `quiet`. Ends
+/// when the watcher or the library is gone.
+fn rescan_when_quiet(changes: &Receiver<()>, shared: &Weak<Shared>, quiet: Duration) {
+    while changes.recv().is_ok() {
+        loop {
+            match changes.recv_timeout(quiet) {
+                Ok(()) => {}
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        start_scan(&shared);
+    }
+}
+
+/// Whether `event` can change the library: anything but a read, on an audio file,
+/// a folder art file, or a folder. A path that is gone may have been a folder.
+fn affects_library(event: &notify::Event) -> bool {
+    !matches!(event.kind, EventKind::Access(_))
+        && (event.paths.is_empty()
+            || event
+                .paths
+                .iter()
+                .any(|p| has_audio_extension(p) || is_art_name(p) || !p.is_file()))
 }
 
 enum Probed {
@@ -417,6 +531,9 @@ fn publish_final(
         unreadable: unreadable.len() as u64,
     };
     *shared.unreadable.lock().unwrap() = unreadable;
+    shared.revision.fetch_add(1, Ordering::SeqCst);
+    drop(st);
+    wake(shared);
 }
 
 /// Recursive walk; symlinks and unreadable directories are skipped.
@@ -437,6 +554,12 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, current: &impl Fn() -> bool) {
             out.push(entry.path());
         }
     }
+}
+
+fn is_art_name(path: &Path) -> bool {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .is_some_and(|n| ART_NAMES.contains(&n.as_str()))
 }
 
 fn has_audio_extension(path: &Path) -> bool {
@@ -664,6 +787,8 @@ mod tests {
             status: Mutex::new(ScanStatus::Scanning { done: 0, total: 0 }),
             unreadable: Mutex::new(Vec::new()),
             generation: AtomicU64::new(1),
+            revision: AtomicU64::new(0),
+            waker: Mutex::new(None),
         }
     }
 
@@ -897,6 +1022,7 @@ mod tests {
         assert_eq!(cache::stamp(&file), None);
         let lib = FsLibrary {
             shared: Arc::new(shared_for_test(dir.path())),
+            watching: Mutex::new(None),
         };
         scan_with(&lib.shared, 1, &[music], 1, |_| {
             Probed::Unreadable("bad".into())
@@ -1251,5 +1377,74 @@ mod tests {
         assert!(lib.wait_idle(WAIT));
         assert_eq!(lib.scan_status(), ScanStatus::Done { unreadable: 0 });
         assert_eq!(lib.albums(None).len(), 2);
+    }
+
+    /// Polls `cond` until it holds or `WAIT` passes.
+    fn eventually(cond: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + WAIT;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn a_watched_folder_rescans_when_audio_is_added_or_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let music = dir.path().join("m");
+        fs::create_dir_all(&music).unwrap();
+        let lib = FsLibrary::open(dir.path().join("library.toml"));
+        lib.add_folder(music.clone());
+        assert!(lib.wait_idle(WAIT));
+        let woken = Arc::new(AtomicUsize::new(0));
+        let count = woken.clone();
+        lib.set_waker(Box::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        lib.watch_with(Duration::from_millis(100));
+
+        let album = music.join("Artist/Album");
+        fs::create_dir_all(&album).unwrap();
+        fs::copy(fixture("flac_16_44.flac"), album.join("01.flac")).unwrap();
+        assert!(eventually(|| lib.albums(None).len() == 1));
+        assert!(
+            woken.load(Ordering::SeqCst) >= 2,
+            "woken on start and finish"
+        );
+
+        fs::remove_dir_all(music.join("Artist")).unwrap();
+        assert!(eventually(|| lib.albums(None).is_empty()));
+    }
+
+    #[test]
+    fn other_files_in_a_watched_folder_do_not_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let music = dir.path().join("m");
+        fs::create_dir_all(&music).unwrap();
+        let lib = FsLibrary::open(dir.path().join("library.toml"));
+        lib.add_folder(music.clone());
+        assert!(lib.wait_idle(WAIT));
+        lib.watch_with(Duration::from_millis(100));
+        let revision = lib.revision();
+        fs::write(music.join("notes.txt"), b"hello").unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(lib.revision(), revision);
+        assert_eq!(lib.scan_status(), ScanStatus::Done { unreadable: 0 });
+    }
+
+    #[test]
+    fn a_folder_added_after_watch_is_watched() {
+        let dir = tempfile::tempdir().unwrap();
+        let music = dir.path().join("m");
+        fs::create_dir_all(&music).unwrap();
+        let lib = FsLibrary::open(dir.path().join("library.toml"));
+        lib.watch_with(Duration::from_millis(100));
+        lib.add_folder(music.clone());
+        assert!(lib.wait_idle(WAIT));
+        fs::copy(fixture("flac_16_44.flac"), music.join("01.flac")).unwrap();
+        assert!(eventually(|| lib.albums(None).len() == 1));
     }
 }

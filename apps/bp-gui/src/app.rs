@@ -64,6 +64,8 @@ pub struct BpApp {
     now_playing: NowPlaying,
     query: String,
     scan_status: ScanStatus,
+    /// The library's revision when it was last picked up.
+    library_revision: u64,
     /// The library was changed from the UI; refresh every frame until its scan is
     /// done. A fast scan can finish between frames and leave the status unchanged.
     library_changed: bool,
@@ -104,6 +106,7 @@ impl BpApp {
             move || ctx.request_repaint()
         };
         deps.player.set_waker(Box::new(waker.clone()));
+        deps.library.set_waker(Box::new(waker.clone()));
         let art = ArtLoader::new(
             deps.library.clone(),
             deps.thumbs_dir,
@@ -116,6 +119,7 @@ impl BpApp {
             .map(Prefs::load)
             .unwrap_or_default();
         let scan_status = deps.library.scan_status();
+        let library_revision = deps.library.revision();
         let mut app = BpApp {
             player: deps.player,
             library: deps.library,
@@ -128,6 +132,7 @@ impl BpApp {
             now_playing: NowPlaying::default(),
             query: String::new(),
             scan_status,
+            library_revision,
             library_changed: false,
             grid_albums: None,
             grid_scroll: 0.0,
@@ -531,12 +536,17 @@ impl BpApp {
         }
     }
 
-    /// Picks up library changes: a changed scan status means the index may have
-    /// changed, and so does a change made from the UI once no scan is running.
+    /// Picks up library changes: a changed scan status or revision means the index
+    /// may have changed, and so does a change made from the UI once no scan is running.
     fn poll_library(&mut self) {
         let status = self.library.scan_status();
+        let revision = self.library.revision();
         let scanning = matches!(status, ScanStatus::Scanning { .. });
-        if status != self.scan_status || (self.library_changed && !scanning) {
+        if status != self.scan_status
+            || revision != self.library_revision
+            || (self.library_changed && !scanning)
+        {
+            self.library_revision = revision;
             if !scanning {
                 self.library_changed = false;
             }

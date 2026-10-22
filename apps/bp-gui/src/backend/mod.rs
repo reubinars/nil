@@ -79,6 +79,13 @@ pub trait LibrarySource: Send + Sync {
     fn scan_status(&self) -> ScanStatus;
     /// Files the last scan couldn't read, with the reason; natural sort by path.
     fn unreadable(&self) -> Vec<(PathBuf, String)>;
+    /// Bumped by every finished scan, including ones the UI didn't start: a change
+    /// means the index may have changed.
+    fn revision(&self) -> u64 {
+        0
+    }
+    /// Called from any thread when a scan starts or finishes on its own.
+    fn set_waker(&self, _waker: Box<dyn Fn() + Send + Sync>) {}
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -35,3 +35,4 @@ id3 = "1.17.2"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 rfd = "0.17.2"
 realfft = "3.4.0"
+notify = "8.2.0"

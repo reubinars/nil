@@ -65,6 +65,12 @@ fn load_profiles(path: &Path) -> ProfileStore {
 }
 
 fn main() -> eframe::Result {
+    #[cfg(windows)]
+    if !bp_gui::instance::acquire() {
+        bp_gui::instance::show_running();
+        return Ok(());
+    }
+
     let config = config_dir();
     let thumbs = thumbs_dir();
     for dir in [&config, &thumbs] {
@@ -77,6 +83,7 @@ fn main() -> eframe::Result {
     let clock = Arc::new(SystemClock::new());
     let player = make_player(&clock);
     let library = Arc::new(FsLibrary::open(config.join("library.toml")));
+    library.watch();
     let prefs_path = config.join("gui.toml");
 
     let options = eframe::NativeOptions {
