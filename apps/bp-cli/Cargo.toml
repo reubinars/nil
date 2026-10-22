@@ -1,0 +1,23 @@
+[package]
+name = "bp-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "bp"
+path = "src/main.rs"
+
+[dependencies]
+bp-core.workspace = true
+bp-decode.workspace = true
+bp-engine.workspace = true
+bp-output.workspace = true
+clap.workspace = true
+crossbeam-channel.workspace = true
+crossterm.workspace = true
+natord.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "bp-decode"
+version.workspace = true
+edition.workspace = true
+
+[features]
+testgen = []
+
+[dependencies]
+bp-core = { path = "../bp-core" }
+symphonia.workspace = true
+
+[dev-dependencies]
+bp-decode = { path = ".", features = ["testgen"] }
+tempfile.workspace = true
+md-5.workspace = true

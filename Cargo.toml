@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/bp-core", "crates/bp-decode", "crates/bp-output", "crates/bp-engine", "apps/bp-cli", "apps/bp-gui"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+symphonia = { version = "0.6.1", default-features = false, features = ["flac", "pcm", "wav", "aiff", "alac", "aac", "isomp4"] }
+rtrb = "0.4.0"
+crossbeam-channel = "0.5.17"
+thiserror = "2.0.21"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+serde_json = "1.0.151"
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = "0.29.0"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+natord = "1.0.9"
+wasapi = "0.26.0"
+windows = "0.62.2"
+md-5 = "0.11.0"
+tempfile = "3.27.0"
+bp-core = { path = "crates/bp-core" }
+bp-decode = { path = "crates/bp-decode" }
+bp-output = { path = "crates/bp-output" }
+bp-engine = { path = "crates/bp-engine" }
+eframe = { version = "0.37.0", features = ["glow"] }
+egui = "0.37.0"
+egui_kittest = "0.37.0"
+lofty = "0.25.4"
+id3 = "1.17.2"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+rfd = "0.17.2"
+realfft = "3.4.0"

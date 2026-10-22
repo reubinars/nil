@@ -1,0 +1,41 @@
+[package]
+name = "bp-gui"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "bp_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bp-gui"
+path = "src/main.rs"
+
+[dependencies]
+bp-core.workspace = true
+bp-decode.workspace = true
+bp-engine.workspace = true
+bp-output.workspace = true
+eframe.workspace = true
+egui.workspace = true
+lofty.workspace = true
+image.workspace = true
+rfd.workspace = true
+natord.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+toml.workspace = true
+serde_json.workspace = true
+id3.workspace = true
+realfft.workspace = true
+
+[dev-dependencies]
+egui_kittest = { workspace = true, features = ["eframe"] }
+tempfile.workspace = true
+bp-decode = { workspace = true, features = ["testgen"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "=0.1.31"
+
+[features]
+snapshots = ["egui_kittest/wgpu", "egui_kittest/snapshot"]

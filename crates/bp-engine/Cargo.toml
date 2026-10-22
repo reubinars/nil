@@ -1,0 +1,19 @@
+[package]
+name = "bp-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bp-core = { path = "../bp-core" }
+bp-decode.workspace = true
+bp-output.workspace = true
+crossbeam-channel.workspace = true
+rtrb.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+bp-decode = { workspace = true, features = ["testgen"] }
+md-5.workspace = true
+tempfile.workspace = true

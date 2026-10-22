@@ -1,0 +1,40 @@
+nil release notes
+=================
+
+0.1.0 — first release
+---------------------
+
+Playback
+- Bit-perfect output through WASAPI exclusive mode, event-driven.
+- FLAC (including MQA, untouched), WAV, AIFF, ALAC, DSF and DFF.
+- DSD as DoP, limited to the rates the DAC actually accepts.
+- AAC-LC, decoded to 24-bit with gapless trimming, marked not bit-perfect.
+- Gapless playback between tracks.
+- A track the DAC can't play as it is gets skipped with the reason, never
+  converted.
+- Device switching mid-track continues at the same position; plugging in or
+  unplugging a DAC updates the device list straight away.
+
+Library
+- Scans your music folders in parallel and keeps an index, so later launches
+  open instantly and only changed files are read again.
+- Albums grouped by tags and folders, including CD1/CD2 folders and tagged
+  compilations.
+- Covers from the files or from folder.jpg / cover.jpg / front.jpg.
+- Settings lists the files that couldn't be read, and why.
+
+Interface
+- Home with your most recently added albums; Albums, Artists and search.
+- Album pages with track lists and formats.
+- A floating now-playing bar with a live spectrum, the bit-perfect badge and
+  the device picker; a full-window Now Playing view with the queue.
+- Settings with your DAC's full capability table.
+- A black, neutral theme with nil's own title bar.
+
+Known limits
+- No conversion fallback yet: DSD256 on a DAC that stops at DSD128, or a
+  sample rate the DAC lacks, is skipped rather than converted.
+- No volume control in nil, by design: set the volume on the DAC or amp.
+- Windows 11's snap-layout menu doesn't appear over nil's maximize button;
+  snapping by dragging and Win+arrow keys still work.
+- Lossy formats other than AAC-LC (MP3, Opus, HE-AAC) are not supported.

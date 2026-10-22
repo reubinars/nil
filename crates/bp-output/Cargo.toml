@@ -1,0 +1,13 @@
+[package]
+name = "bp-output"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bp-core.workspace = true
+rtrb.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+tracing.workspace = true
+wasapi.workspace = true
+windows = { workspace = true, features = ["Win32_Media_Audio", "Win32_System_Threading", "Win32_Foundation"] }
