@@ -1,8 +1,8 @@
 nil release notes
 =================
 
-Unreleased
-----------
+0.3.1
+-----
 
 Audio
 - Settings > Audio has a DSD over PCM (DoP) switch for the selected DAC.
