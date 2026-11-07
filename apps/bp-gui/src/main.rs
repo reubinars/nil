@@ -4,12 +4,15 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use bp_engine::home::{init_file_logging, resolve_home};
 use bp_engine::profile::ProfileStore;
 use bp_gui::app::{BpApp, Deps};
 use bp_gui::backend::PlayerHandle;
 use bp_gui::backend::fs_library::FsLibrary;
 use bp_gui::backend::mock_player::{MockPlayer, SystemClock, demo_devices};
-use bp_gui::paths::{config_dir, thumbs_dir};
+use bp_gui::migrate::{Migration, OldDirs, migrate_home};
+use bp_gui::paths::{home, set_home};
+use bp_gui::plugins::host::{PluginHost, Timings};
 
 /// The real engine on Windows, unless `--mock` asks for the demo player.
 fn make_player(clock: &Arc<SystemClock>) -> Box<dyn PlayerHandle> {
@@ -22,12 +25,11 @@ fn make_player(clock: &Arc<SystemClock>) -> Box<dyn PlayerHandle> {
 
 #[cfg(windows)]
 fn real_player() -> Box<dyn PlayerHandle> {
-    use bp_engine::profile::default_dir;
     use bp_engine::{Engine, EngineConfig};
     use bp_gui::backend::engine_player::EnginePlayer;
     use bp_output::WasapiBackend;
 
-    let path = default_dir().join("devices.toml");
+    let path = home().data_dir().join("devices.toml");
     let profiles = load_profiles(&path);
     let engine = Engine::start(
         Box::new(WasapiBackend::new()),
@@ -64,15 +66,54 @@ fn load_profiles(path: &Path) -> ProfileStore {
     }
 }
 
+/// Starts the plugin host once the window exists; its threads wake the UI.
+fn start_plugins(ctx: &egui::Context) -> PluginHost {
+    let ctx = ctx.clone();
+    PluginHost::start(
+        home().plugins_dir(),
+        home().data_dir().join("plugins.toml"),
+        home().logs_dir(),
+        Timings::default(),
+        Arc::new(move || ctx.request_repaint()),
+    )
+}
+
 fn main() -> eframe::Result {
+    // The single-instance lock comes before migration: a second quick launch must exit
+    // without touching `data.partial` while the first is still copying into it. The lock
+    // does not depend on the home folder.
     #[cfg(windows)]
     if !bp_gui::instance::acquire() {
         bp_gui::instance::show_running();
         return Ok(());
     }
 
-    let config = config_dir();
-    let thumbs = thumbs_dir();
+    let mut resolved = resolve_home();
+    // Before logging opens `bp.log`, so the old log is not held open while it is moved.
+    let migration = migrate_home(&mut resolved, &OldDirs::from_env());
+    let logs_dir = resolved.logs_dir();
+    set_home(resolved);
+
+    init_file_logging(&logs_dir, "bp_gui");
+    if let Some(reason) = &home().fallback_reason {
+        tracing::warn!("{reason}");
+    }
+    match &migration {
+        Migration::NotNeeded => {}
+        Migration::Migrated => tracing::info!("moved the bitperfect folders into data\\"),
+        Migration::CopyFailed { reason, use_dir } => tracing::warn!(
+            "could not move the bitperfect folders ({reason}); using {} this run",
+            use_dir.display()
+        ),
+        Migration::CleanupPending(reason) => {
+            tracing::warn!(
+                "could not delete the old bitperfect folders ({reason}); retrying next start"
+            );
+        }
+    }
+
+    let config = home().data_dir();
+    let thumbs = home().thumbs_dir();
     for dir in [&config, &thumbs] {
         if let Err(e) = std::fs::create_dir_all(dir) {
             eprintln!("bp-gui: cannot create {}: {e}", dir.display());
@@ -107,7 +148,10 @@ fn main() -> eframe::Result {
                 clock,
                 prefs_path: Some(prefs_path),
                 thumbs_dir: thumbs,
+                playlists_dir: home().playlists_dir(),
                 pick_folder: Box::new(|| rfd::FileDialog::new().pick_folder()),
+                plugins: Some(start_plugins(&cc.egui_ctx)),
+                home: home().clone(),
             };
             Ok(Box::new(BpApp::new(&cc.egui_ctx, deps)))
         }),

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use bp_core::{
     Capabilities, DeviceFormat, DeviceId, DeviceInfo, EngineError, PROBE_ENCODINGS, PROBE_RATES,
 };
-use bp_engine::{AnalysisTap, Event};
+use bp_engine::{AnalysisTap, Event, RearrangeRefusal};
 
 use super::{DeviceCaps, PlayerCommand, PlayerEvent, PlayerHandle, QueueItem};
 use crate::state::support::track_support;
@@ -23,6 +23,8 @@ const TAP_RATE: u32 = 44_100;
 const TICK: Duration = Duration::from_millis(250);
 /// `Previous` past this position restarts the current track.
 const RESTART_AFTER: Duration = Duration::from_secs(3);
+/// The engine's decoder runs this far ahead of playback.
+const DECODE_LEAD: Duration = Duration::from_secs(2);
 
 /// Time source for the simulation.
 pub trait Clock: Send + Sync {
@@ -129,6 +131,8 @@ impl MockPlayer {
                 devices,
                 selected,
                 queue: Vec::new(),
+                insert_end: None,
+                held: false,
                 phase: Phase::Stopped,
                 outbox: VecDeque::new(),
                 sent: Vec::new(),
@@ -173,6 +177,14 @@ impl MockPlayer {
             sim.devices = devices;
         }
         self.inject(PlayerEvent::DevicesChanged);
+    }
+
+    /// While on, events are kept back from `try_recv`; turned off, they come out in order.
+    pub fn hold_events(&self, on: bool) {
+        self.sim.lock().unwrap().held = on;
+        if !on {
+            self.wake();
+        }
     }
 
     /// Every command sent so far.
@@ -238,6 +250,9 @@ impl PlayerHandle for MockPlayer {
         let now = self.clock.now();
         let mut sim = self.sim.lock().unwrap();
         sim.advance(now);
+        if sim.held {
+            return None;
+        }
         sim.outbox.pop_front()
     }
 
@@ -319,6 +334,10 @@ struct Sim {
     devices: Vec<MockDevice>,
     selected: Option<DeviceId>,
     queue: Vec<QueueItem>,
+    /// End of the last insert, like the engine's insert point.
+    insert_end: Option<usize>,
+    /// While set, `try_recv` hands out nothing and events wait in order.
+    held: bool,
     phase: Phase,
     outbox: VecDeque<PlayerEvent>,
     sent: Vec<PlayerCommand>,
@@ -482,7 +501,82 @@ impl Sim {
         match cmd {
             PlayerCommand::Play { items, start } => {
                 self.queue = items;
+                self.insert_end = None;
                 self.open(start, now, Duration::ZERO, false);
+            }
+            PlayerCommand::Insert { items } => {
+                if items.is_empty() {
+                    return;
+                }
+                let Some((index, position)) = self.current(now) else {
+                    self.queue = items;
+                    self.insert_end = None;
+                    self.open(0, now, Duration::ZERO, false);
+                    return;
+                };
+                let left = self.queue[index].duration.saturating_sub(position);
+                let decoding = if left <= DECODE_LEAD {
+                    index + 1
+                } else {
+                    index
+                };
+                let at = self
+                    .insert_end
+                    .unwrap_or(0)
+                    .max(decoding + 1)
+                    .min(self.queue.len());
+                let count = items.len();
+                self.queue.splice(at..at, items);
+                self.insert_end = Some(at + count);
+                self.emit(Event::Inserted { at, count });
+            }
+            PlayerCommand::Rearrange {
+                from,
+                expected,
+                items,
+            } => {
+                let reason = match self.current(now) {
+                    None => Some(RearrangeRefusal::Stopped),
+                    Some((index, position)) => {
+                        let left = self.queue[index].duration.saturating_sub(position);
+                        let decoding = if left <= DECODE_LEAD {
+                            index + 1
+                        } else {
+                            index
+                        };
+                        if from < decoding + 1 {
+                            Some(RearrangeRefusal::Started)
+                        } else if from > self.queue.len()
+                            || !self.queue[from..]
+                                .iter()
+                                .map(|i| &i.path)
+                                .eq(expected.iter().map(|i| &i.path))
+                        {
+                            Some(RearrangeRefusal::Changed)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                match reason {
+                    Some(reason) => self.emit(Event::RearrangeRefused { from, reason }),
+                    None => {
+                        self.queue.splice(from.., items);
+                        self.insert_end = None;
+                        self.emit(Event::Rearranged { from });
+                    }
+                }
+            }
+            PlayerCommand::Append { items } => {
+                if items.is_empty() {
+                    return;
+                }
+                if matches!(self.phase, Phase::Stopped) {
+                    self.queue = items;
+                    self.open(0, now, Duration::ZERO, false);
+                } else {
+                    self.queue.extend(items);
+                }
             }
             PlayerCommand::Pause => {
                 let position = self.current(now).map(|(_, p)| p);
@@ -526,13 +620,18 @@ impl Sim {
                 }
                 self.emit(Event::Resumed);
             }
-            PlayerCommand::Stop => self.phase = Phase::Stopped,
+            PlayerCommand::Stop => {
+                self.insert_end = None;
+                self.phase = Phase::Stopped;
+            }
             PlayerCommand::Next => {
+                self.insert_end = None;
                 if let Some((index, _)) = self.current(now) {
                     self.open(index + 1, now, Duration::ZERO, self.paused());
                 }
             }
             PlayerCommand::Previous => {
+                self.insert_end = None;
                 if let Some((index, position)) = self.current(now) {
                     let target = if position > RESTART_AFTER || index == 0 {
                         index
@@ -543,12 +642,14 @@ impl Sim {
                 }
             }
             PlayerCommand::Seek { position } => {
+                self.insert_end = None;
                 if let Some((index, _)) = self.current(now) {
                     self.open(index, now, position, self.paused());
                 }
             }
             PlayerCommand::SelectDevice { id } => {
                 if self.devices.iter().any(|d| d.info.id == id) {
+                    self.insert_end = None;
                     self.selected = Some(id);
                     if let Some((index, position)) = self.current(now) {
                         self.open(index, now, position, self.paused());
@@ -556,7 +657,16 @@ impl Sim {
                 }
             }
             PlayerCommand::RefreshDevices => self.outbox.push_back(PlayerEvent::DevicesChanged),
+            PlayerCommand::SetDop { id, enabled } => {
+                if let Some(d) = self.devices.iter_mut().find(|d| d.info.id == id) {
+                    d.caps.dop_enabled = enabled;
+                    self.outbox.push_back(PlayerEvent::DevicesChanged);
+                }
+            }
             PlayerCommand::Reprobe { id } => {
+                if self.selected.as_ref() == Some(&id) {
+                    self.insert_end = None;
+                }
                 self.outbox.push_back(PlayerEvent::DevicesChanged);
                 if self.selected.as_ref() == Some(&id)
                     && let Some((index, position)) = self.current(now)
@@ -621,6 +731,8 @@ mod tests {
                 Event::Paused => "paused".into(),
                 Event::Resumed => "resumed".into(),
                 Event::QueueFinished => "finished".into(),
+                Event::Rearranged { from } => format!("rearranged {from}"),
+                Event::RearrangeRefused { from, reason } => format!("refused {from} {reason:?}"),
                 other => format!("{other:?}"),
             },
         }
@@ -650,6 +762,127 @@ mod tests {
 
     fn album() -> Vec<QueueItem> {
         vec![item("a", pcm(44_100, 16), 1), item("b", pcm(44_100, 16), 1)]
+    }
+
+    fn album3() -> Vec<QueueItem> {
+        vec![
+            item("a", pcm(44_100, 16), 300),
+            item("b", pcm(44_100, 16), 300),
+            item("c", pcm(44_100, 16), 300),
+        ]
+    }
+
+    fn play_album3(p: &MockPlayer, clock: &ManualClock, until_ms: u64) {
+        p.send(PlayerCommand::Play {
+            items: album3(),
+            start: 0,
+        });
+        run(p, clock, until_ms);
+    }
+
+    #[test]
+    fn rearrange_applies_to_upcoming_tracks() {
+        let (p, clock) = setup();
+        let a = album3();
+        play_album3(&p, &clock, 1000);
+        p.send(PlayerCommand::Rearrange {
+            from: 1,
+            expected: vec![a[1].clone(), a[2].clone()],
+            items: vec![a[2].clone()],
+        });
+        let mut paths = Vec::new();
+        let mut log = Vec::new();
+        loop {
+            while let Some(ev) = p.try_recv() {
+                if let PlayerEvent::Engine(Event::TrackStarted { path, .. }) = &ev {
+                    paths.push(path.clone());
+                }
+                log.push((now_ms(&clock), summary(&ev)));
+            }
+            if now_ms(&clock) >= 302_000 {
+                break;
+            }
+            clock.advance(Duration::from_millis(500));
+        }
+        assert_eq!(milestones(&log)[0].1, "rearranged 1");
+        assert_eq!(paths, vec![a[2].path.clone()]);
+    }
+
+    #[test]
+    fn rearrange_in_the_last_two_seconds_is_refused_started() {
+        let (p, clock) = setup();
+        let a = album3();
+        play_album3(&p, &clock, 299_300);
+        p.send(PlayerCommand::Rearrange {
+            from: 1,
+            expected: vec![a[1].clone(), a[2].clone()],
+            items: vec![a[2].clone()],
+        });
+        let log = run(&p, &clock, 299_400);
+        assert!(
+            milestones(&log)
+                .iter()
+                .any(|(_, s)| *s == "refused 1 Started"),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn rearrange_with_a_stale_tail_is_refused_changed() {
+        let (p, clock) = setup();
+        let a = album3();
+        play_album3(&p, &clock, 1000);
+        p.send(PlayerCommand::Rearrange {
+            from: 1,
+            expected: vec![a[2].clone(), a[1].clone()],
+            items: vec![],
+        });
+        let log = run(&p, &clock, 1100);
+        assert!(
+            milestones(&log)
+                .iter()
+                .any(|(_, s)| *s == "refused 1 Changed"),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn rearrange_while_stopped_is_refused_stopped() {
+        let (p, clock) = setup();
+        p.send(PlayerCommand::Rearrange {
+            from: 1,
+            expected: vec![],
+            items: vec![],
+        });
+        let log = run(&p, &clock, 100);
+        assert_eq!(milestones(&log), vec![(0, "refused 1 Stopped")]);
+    }
+
+    #[test]
+    fn held_events_come_out_in_order_when_released() {
+        let (open, oclock) = setup();
+        open.send(PlayerCommand::Play {
+            items: album(),
+            start: 0,
+        });
+        let expected: Vec<String> = run(&open, &oclock, 1000)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+
+        let (p, clock) = setup();
+        p.hold_events(true);
+        p.send(PlayerCommand::Play {
+            items: album(),
+            start: 0,
+        });
+        clock.advance(Duration::from_secs(1));
+        assert!(p.try_recv().is_none());
+        p.hold_events(false);
+        let got: Vec<String> = std::iter::from_fn(|| p.try_recv())
+            .map(|e| summary(&e))
+            .collect();
+        assert_eq!(got, expected);
     }
 
     #[test]
@@ -712,6 +945,122 @@ mod tests {
             .map(|e| summary(&e))
             .collect();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn append_while_playing_extends_the_queue() {
+        let (p, clock) = setup();
+        p.send(PlayerCommand::Play {
+            items: vec![item("a", pcm(44_100, 16), 1)],
+            start: 0,
+        });
+        run(&p, &clock, 500);
+        p.send(PlayerCommand::Append { items: album() });
+        let log = run(&p, &clock, 1500);
+        assert!(
+            milestones(&log).contains(&(1300, "started 1 Native")),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn append_when_stopped_plays_from_the_first_item() {
+        let (p, clock) = setup();
+        p.send(PlayerCommand::Append { items: album() });
+        let log = run(&p, &clock, 500);
+        assert_eq!(milestones(&log), vec![(300, "started 0 Native")]);
+    }
+
+    #[test]
+    fn insert_early_in_a_track_goes_next() {
+        let (p, clock) = setup();
+        p.send(PlayerCommand::Play {
+            items: vec![
+                item("a", pcm(44_100, 16), 10),
+                item("b", pcm(44_100, 16), 10),
+            ],
+            start: 0,
+        });
+        run(&p, &clock, 500);
+        p.send(PlayerCommand::Insert {
+            items: vec![item("x", pcm(44_100, 16), 10)],
+        });
+        let log = run(&p, &clock, 10_500);
+        assert!(
+            log.iter().any(|(_, s)| s == "Inserted { at: 1, count: 1 }"),
+            "{log:?}"
+        );
+        let started: Vec<_> = milestones(&log)
+            .into_iter()
+            .filter(|(_, s)| s.starts_with("started"))
+            .collect();
+        assert_eq!(started[0], (10_300, "started 1 Native"));
+        let queue = p.sim.lock().unwrap().queue.clone();
+        let names: Vec<_> = queue.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(names, ["a", "x", "b"]);
+    }
+
+    #[test]
+    fn insert_in_the_last_two_seconds_goes_after_the_next_track() {
+        let (p, clock) = setup();
+        p.send(PlayerCommand::Play {
+            items: vec![
+                item("a", pcm(44_100, 16), 10),
+                item("b", pcm(44_100, 16), 10),
+            ],
+            start: 0,
+        });
+        run(&p, &clock, 9_300);
+        p.send(PlayerCommand::Insert {
+            items: vec![item("x", pcm(44_100, 16), 10)],
+        });
+        let log = run(&p, &clock, 9_400);
+        assert!(
+            log.iter().any(|(_, s)| s == "Inserted { at: 2, count: 1 }"),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn two_inserts_keep_their_order() {
+        let (p, clock) = setup();
+        p.send(PlayerCommand::Play {
+            items: vec![
+                item("a", pcm(44_100, 16), 10),
+                item("b", pcm(44_100, 16), 10),
+            ],
+            start: 0,
+        });
+        run(&p, &clock, 500);
+        for name in ["x", "y"] {
+            p.send(PlayerCommand::Insert {
+                items: vec![item(name, pcm(44_100, 16), 10)],
+            });
+        }
+        let log = run(&p, &clock, 600);
+        let inserted: Vec<_> = log
+            .iter()
+            .map(|(_, s)| s.as_str())
+            .filter(|s| s.starts_with("Inserted"))
+            .collect();
+        assert_eq!(
+            inserted,
+            [
+                "Inserted { at: 1, count: 1 }",
+                "Inserted { at: 2, count: 1 }"
+            ]
+        );
+        let queue = p.sim.lock().unwrap().queue.clone();
+        let names: Vec<_> = queue.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(names, ["a", "x", "y", "b"]);
+    }
+
+    #[test]
+    fn insert_when_stopped_plays_the_items() {
+        let (p, clock) = setup();
+        p.send(PlayerCommand::Insert { items: album() });
+        let log = run(&p, &clock, 500);
+        assert_eq!(milestones(&log), vec![(300, "started 0 Native")]);
     }
 
     #[test]
@@ -883,6 +1232,24 @@ mod tests {
         assert!(matches!(p.try_recv(), Some(PlayerEvent::DevicesChanged)));
         assert!(p.try_recv().is_none());
         assert_eq!(p.sent(), vec![PlayerCommand::Reprobe { id }]);
+    }
+
+    #[test]
+    fn set_dop_changes_the_caps_and_emits_devices_changed() {
+        let (p, _clock) = setup();
+        let id = DeviceId("dac-a".into());
+        p.send(PlayerCommand::SetDop {
+            id: id.clone(),
+            enabled: false,
+        });
+        assert!(matches!(p.try_recv(), Some(PlayerEvent::DevicesChanged)));
+        assert!(p.try_recv().is_none());
+        assert!(!p.device_caps(&id).unwrap().dop_enabled);
+        let b = DeviceId("dac-b".into());
+        assert!(
+            p.device_caps(&b).unwrap().dop_enabled,
+            "other devices keep theirs"
+        );
     }
 
     #[test]

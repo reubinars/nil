@@ -1,4 +1,8 @@
 //! `bp`: command-line front end for the bit-perfect player.
+//!
+//! A developer tool; the release package ships only `nil.exe`. It resolves its home
+//! from its own exe folder (so it shares data only with a nil next to it) and never
+//! moves the old `bitperfect` folders: that migration is nil's job.
 
 mod display;
 mod play;
@@ -7,18 +11,14 @@ mod tracks;
 use std::error::Error;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Mutex;
 
 use bp_core::DeviceId;
+use bp_engine::home::{init_file_logging, resolve_home};
 use bp_engine::negotiate::candidates;
-use bp_engine::profile::{self, DeviceProfile, ProfileStore, merge_probe};
+use bp_engine::profile::{DeviceProfile, ProfileStore, merge_probe};
 use bp_engine::{Engine, EngineConfig};
 use bp_output::OutputBackend;
 use clap::{Parser, Subcommand, ValueEnum};
-use tracing_subscriber::Layer;
-use tracing_subscriber::filter::{LevelFilter, Targets};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
@@ -92,34 +92,13 @@ fn require_backend() -> Result<Box<dyn OutputBackend>, ExitCode> {
 }
 
 fn profile_path() -> PathBuf {
-    profile::default_dir().join("devices.toml")
+    resolve_home().data_dir().join("devices.toml")
 }
 
-/// Writes `bp.log` next to the profile file. Nothing is ever logged to the terminal, which
-/// is in raw mode during `play`.
+/// Writes `bp.log` under the home's `data\logs`. Nothing is ever logged to the terminal,
+/// which is in raw mode during `play`.
 fn init_logging() {
-    let dir = profile::default_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("bp.log"))
-    else {
-        return;
-    };
-    // The `wasapi` crate logs every buffer write at trace via `log`; keep it (and anything
-    // else unknown) at warn or above.
-    let filter = Targets::new()
-        .with_default(LevelFilter::WARN)
-        .with_target("bp_cli", LevelFilter::INFO)
-        .with_target("bp_engine", LevelFilter::INFO)
-        .with_target("bp_output", LevelFilter::INFO)
-        .with_target("bp_decode", LevelFilter::INFO);
-    let layer = tracing_subscriber::fmt::layer()
-        .with_writer(Mutex::new(file))
-        .with_ansi(false)
-        .with_filter(filter);
-    let _ = tracing_subscriber::registry().with(layer).try_init();
+    init_file_logging(&resolve_home().logs_dir(), "bp_cli");
 }
 
 /// `--device`, else the profile file's last used device, else (with a backend) the system

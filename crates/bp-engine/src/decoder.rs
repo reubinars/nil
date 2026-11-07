@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::analysis::{AnalysisTap, analysis_rate, downmix};
 use crate::negotiate::candidates;
+use crate::queue::{Shared, lock};
 
 /// How often a decoder waiting for a stream checks `cancel`.
 const REPLY_POLL: Duration = Duration::from_millis(10);
@@ -57,8 +58,9 @@ pub(crate) enum DecoderMsg {
     StreamEnd { end_frame: u64 },
     /// The current stream holds enough data to start.
     Primed,
-    /// End of the queue.
-    Done,
+    /// End of the queue: the decoder took `tracks` tracks of the queue in total (played,
+    /// skipped or before the job's start).
+    Done { tracks: usize },
 }
 
 /// Control → decoder, answering `NeedStream`.
@@ -72,9 +74,10 @@ pub(crate) enum StreamReply {
 
 /// What the decoder plays and with which device capabilities.
 pub(crate) struct Job {
-    pub tracks: Vec<PathBuf>,
+    /// Shared with the control thread, which appends and inserts while it plays.
+    pub queue: Shared,
     pub start: usize,
-    /// Position within `tracks[start]`.
+    /// Position within track `start`.
     pub start_pos: Duration,
     pub caps: Capabilities,
     pub dop: bool,
@@ -132,19 +135,20 @@ pub(crate) fn run(
         analysis: job.analysis,
         mono: Vec::new(),
     };
-    if d.run(job.tracks, job.start, job.start_pos).is_err() {
+    if d.run(&job.queue, job.start, job.start_pos).is_err() {
         debug!("decoder cancelled");
     }
 }
 
 impl Decoder {
-    fn run(
-        &mut self,
-        tracks: Vec<PathBuf>,
-        start: usize,
-        start_pos: Duration,
-    ) -> Result<(), Cancelled> {
-        for (index, path) in tracks.into_iter().enumerate().skip(start) {
+    /// Walks the queue from `start`. The next track is taken only once the last one is
+    /// decoded, so appended and inserted tracks continue the same stream when their format
+    /// allows. The lock is held only while taking a track.
+    fn run(&mut self, queue: &Shared, start: usize, start_pos: Duration) -> Result<(), Cancelled> {
+        let mut index = start;
+        loop {
+            let next = lock(queue).take(index);
+            let Some(path) = next else { break };
             self.check_cancel()?;
             let pos = if index == start {
                 start_pos
@@ -152,9 +156,10 @@ impl Decoder {
                 Duration::ZERO
             };
             self.track(index, path, pos)?;
+            index += 1;
         }
         self.end_stream()?;
-        self.send(DecoderMsg::Done)
+        self.send(DecoderMsg::Done { tracks: index })
     }
 
     fn track(&mut self, index: usize, path: PathBuf, pos: Duration) -> Result<(), Cancelled> {

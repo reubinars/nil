@@ -102,6 +102,16 @@ impl Control {
         }
     }
 
+    /// Turns DoP on or off for `id`, saves and publishes; ignored for a device never probed.
+    pub(super) fn set_dop(&mut self, id: &DeviceId, enabled: bool) {
+        if !self.profiles.set_dop(id, enabled) {
+            return;
+        }
+        info!(device = %id.0, enabled, "DoP set");
+        self.save_profiles();
+        self.publish_devices(None);
+    }
+
     /// Plays on `id` from now on: playback in progress continues from where it is on the
     /// new device. Nothing happens if `id` is the device in use. A device that is not
     /// listed (any more) stops playback, and the list is published again.

@@ -1,0 +1,6 @@
+name = "hello"                        # must equal the folder name
+version = "0.1.0"
+description = "Greets you and shows ten random tracks from your library"
+api_version = 1
+command = ["python", "hello.py"]      # run from this folder
+permissions = ["library", "playback"]

@@ -1,6 +1,7 @@
 //! The device capability table shown in the device popover.
 
 use bp_core::{PROBE_ENCODINGS, PROBE_RATES, SampleEncoding, SourceFormat, SourceKind};
+use bp_engine::negotiate::max_dop_multiple;
 
 use super::support::track_support;
 use crate::backend::DeviceCaps;
@@ -15,6 +16,10 @@ pub struct CapTable {
     pub rows: Vec<(String, Vec<bool>)>,
     /// `(DSD multiple, playable over DoP)`.
     pub dsd: Vec<(u16, bool)>,
+    /// The device's DoP setting.
+    pub dop_on: bool,
+    /// Some 2-channel probed format can carry DoP, whatever the setting.
+    pub dop_possible: bool,
 }
 
 fn label(e: SampleEncoding) -> String {
@@ -57,7 +62,13 @@ pub fn cap_table(dev: &DeviceCaps) -> CapTable {
             (multiple, track_support(&src, dev).is_ok())
         })
         .collect();
-    CapTable { rates, rows, dsd }
+    CapTable {
+        rates,
+        rows,
+        dsd,
+        dop_on: dev.dop_enabled,
+        dop_possible: max_dop_multiple(&dev.caps, 2).is_some(),
+    }
 }
 
 #[cfg(test)]
@@ -77,5 +88,16 @@ mod tests {
         assert_eq!(labels, ["16/16", "24/24", "32/24", "32/32", "32f"]);
         assert!(t.rows.iter().all(|(_, cells)| cells.iter().all(|&c| c)));
         assert_eq!(t.dsd, vec![(64, true), (128, false), (256, false)]);
+        assert!(t.dop_on && t.dop_possible);
+    }
+
+    #[test]
+    fn dop_possible_follows_the_probe_not_the_setting() {
+        let off = cap_table(&caps_up_to(192_000, false));
+        assert!(!off.dop_on && off.dop_possible);
+        assert_eq!(off.dsd, vec![(64, false), (128, false), (256, false)]);
+        // No 176.4 kHz: no rate carries DoP.
+        let none = cap_table(&caps_up_to(96_000, true));
+        assert!(none.dop_on && !none.dop_possible);
     }
 }

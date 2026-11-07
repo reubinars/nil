@@ -165,6 +165,43 @@ pub fn play(rig: &Rig, tracks: Vec<PathBuf>, start: usize) {
     rig.engine.send(Command::Play { tracks, start });
 }
 
+/// Plays `tracks` but pauses before the first stream starts, so the test controls exactly
+/// what is played.
+pub fn play_paused(rig: &Rig, tracks: Vec<PathBuf>) {
+    play(rig, tracks, 0);
+    rig.engine.send(Command::Pause);
+    wait_for(&rig.engine, TIMEOUT, |e| matches!(e, Event::Paused));
+}
+
+/// Writes a 16-bit 44.1 kHz stereo WAV of `seconds` of a non-silent ramp into `dir`: longer
+/// than the 2 s ring, unlike the fixtures.
+pub fn long_wav(dir: &Path, seconds: u32) -> PathBuf {
+    let frames = 44_100 * seconds;
+    let mut data = Vec::with_capacity(frames as usize * 4);
+    for i in 0..frames {
+        let v = ((i % 2_000) as i16 - 1_000) * 16;
+        data.extend(v.to_le_bytes());
+        data.extend((-v).to_le_bytes());
+    }
+    let mut wav = Vec::new();
+    wav.extend(b"RIFF");
+    wav.extend((36 + data.len() as u32).to_le_bytes());
+    wav.extend(b"WAVEfmt ");
+    wav.extend(16u32.to_le_bytes());
+    wav.extend(1u16.to_le_bytes()); // PCM
+    wav.extend(2u16.to_le_bytes());
+    wav.extend(44_100u32.to_le_bytes());
+    wav.extend((44_100u32 * 4).to_le_bytes());
+    wav.extend(4u16.to_le_bytes());
+    wav.extend(16u16.to_le_bytes());
+    wav.extend(b"data");
+    wav.extend((data.len() as u32).to_le_bytes());
+    wav.extend(data);
+    let path = dir.join(format!("long_{seconds}s.wav"));
+    std::fs::write(&path, wav).unwrap();
+    path
+}
+
 /// Collects events until `pred` matches one (included in the result); panics on timeout.
 pub fn wait_for(engine: &Engine, timeout: Duration, pred: impl Fn(&Event) -> bool) -> Vec<Event> {
     let deadline = Instant::now() + timeout;

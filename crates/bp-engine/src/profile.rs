@@ -149,6 +149,15 @@ impl ProfileStore {
         }
     }
 
+    /// Turns DoP on or off for a known device; returns whether the device is known.
+    pub fn set_dop(&mut self, id: &DeviceId, enabled: bool) -> bool {
+        let Some(p) = self.devices.get_mut(&id.0) else {
+            return false;
+        };
+        p.dop_enabled = enabled;
+        true
+    }
+
     /// Writes `<path>.tmp` then renames it over `<path>`.
     pub fn save(&self) -> Result<(), EngineError> {
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -165,19 +174,6 @@ impl ProfileStore {
         let tmp = PathBuf::from(tmp);
         std::fs::write(&tmp, text).map_err(|e| profile_err("writing", &tmp, e))?;
         std::fs::rename(&tmp, &self.path).map_err(|e| profile_err("renaming to", &self.path, e))
-    }
-}
-
-/// Directory holding `devices.toml` and `bp.log`.
-pub fn default_dir() -> PathBuf {
-    let (var, rel) = if cfg!(windows) {
-        ("APPDATA", "")
-    } else {
-        ("HOME", ".config")
-    };
-    match std::env::var_os(var) {
-        Some(base) => PathBuf::from(base).join(rel).join("bitperfect"),
-        None => PathBuf::from("."),
     }
 }
 
@@ -316,6 +312,20 @@ mod tests {
         // unknown device: no-op
         store.disable_format(&DeviceId("other".into()), &f);
         assert!(store.get(&DeviceId("other".into())).is_none());
+    }
+
+    #[test]
+    fn set_dop_changes_only_known_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ProfileStore::load(&dir.path().join("devices.toml")).unwrap();
+        store.upsert(&id(), profile());
+        assert!(store.set_dop(&id(), false));
+        assert!(!store.get(&id()).unwrap().dop_enabled);
+        assert!(store.set_dop(&id(), true));
+        assert_eq!(store.get(&id()), Some(&profile()));
+        let other = DeviceId("other".into());
+        assert!(!store.set_dop(&other, true));
+        assert!(store.get(&other).is_none());
     }
 
     #[test]

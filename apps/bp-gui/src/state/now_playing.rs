@@ -1,6 +1,6 @@
 //! Now-playing state, reduced from player commands and events.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use bp_engine::Event;
 use crate::backend::{PlayerCommand, PlayerEvent, QueueItem};
 
 /// How long a skip notice stays up.
-const NOTICE_TIME: Duration = Duration::from_secs(4);
+pub(crate) const NOTICE_TIME: Duration = Duration::from_secs(4);
 /// `Previous` past this position restarts the current track.
 const RESTART_AFTER: Duration = Duration::from_secs(3);
 
@@ -41,6 +41,14 @@ pub struct NowPlaying {
     pub notice: Option<(String, Duration)>,
     pub fatal: Option<String>,
     pub track_errors: HashMap<PathBuf, String>,
+    /// Inserts sent while playing, waiting for the engine to say where they went. `None`
+    /// once a Play or Stop made the answer stale, as for `pending_rearranges`. Dropped
+    /// when playback ends: the engine answers an insert only while it is playing.
+    pending_inserts: VecDeque<Option<Vec<QueueItem>>>,
+    /// Rearranges sent, one per engine answer: `(from, rows replaced, items)`. `None` once
+    /// a Play or Stop made the answer stale: it still pops its own entry but changes
+    /// nothing.
+    pending_rearranges: VecDeque<Option<(usize, usize, Vec<QueueItem>)>>,
 }
 
 impl NowPlaying {
@@ -48,12 +56,52 @@ impl NowPlaying {
     pub fn on_command(&mut self, cmd: &PlayerCommand) {
         match cmd {
             PlayerCommand::Play { items, start } => {
+                self.void_pending();
                 self.queue = items.clone();
                 self.index = Some(*start);
                 self.position = Duration::ZERO;
                 self.duration = items.get(*start).map(|i| i.duration);
                 self.paused = false;
                 self.opening();
+            }
+            PlayerCommand::Append { items } => {
+                // After a fatal error the player has no playback, so it starts afresh.
+                if self.index.is_some() && self.fatal.is_none() {
+                    self.queue.extend(items.iter().cloned());
+                } else if !items.is_empty() {
+                    // Nothing playing: the player starts them from the first, as for Play.
+                    self.queue = items.clone();
+                    self.index = Some(0);
+                    self.position = Duration::ZERO;
+                    self.duration = items.first().map(|i| i.duration);
+                    self.paused = false;
+                    self.opening();
+                }
+            }
+            PlayerCommand::Insert { items } => {
+                if self.index.is_some() && self.fatal.is_none() {
+                    if !items.is_empty() {
+                        self.pending_inserts.push_back(Some(items.clone()));
+                    }
+                } else if !items.is_empty() {
+                    // Not cleared: inserts a Stop made stale are still answered, in order.
+                    self.void_pending();
+                    self.queue = items.clone();
+                    self.index = Some(0);
+                    self.position = Duration::ZERO;
+                    self.duration = items.first().map(|i| i.duration);
+                    self.paused = false;
+                    self.opening();
+                }
+            }
+            // The engine's answer decides what happens to the queue.
+            PlayerCommand::Rearrange {
+                from,
+                expected,
+                items,
+            } => {
+                self.pending_rearranges
+                    .push_back(Some((*from, expected.len(), items.clone())));
             }
             // These restart a stream; with nothing playing the player ignores them.
             PlayerCommand::Next => {
@@ -84,12 +132,47 @@ impl NowPlaying {
                 }
             }
             PlayerCommand::Stop => {
+                self.void_pending();
                 self.badge = Badge::Idle;
                 self.index = None;
                 self.paused = false;
             }
-            PlayerCommand::Pause | PlayerCommand::Resume | PlayerCommand::RefreshDevices => {}
+            // The stream in progress is untouched by these.
+            PlayerCommand::Pause
+            | PlayerCommand::Resume
+            | PlayerCommand::RefreshDevices
+            | PlayerCommand::SetDop { .. } => {}
         }
+    }
+
+    /// The queue the pending inserts and rearranges were for is gone: their answers will
+    /// change nothing.
+    fn void_pending(&mut self) {
+        for entry in &mut self.pending_inserts {
+            *entry = None;
+        }
+        for entry in &mut self.pending_rearranges {
+            *entry = None;
+        }
+    }
+
+    /// Playback ended: inserts not answered yet never will be, and its rearranges are stale.
+    fn end_pending(&mut self) {
+        self.pending_inserts.clear();
+        for entry in &mut self.pending_rearranges {
+            *entry = None;
+        }
+    }
+
+    /// True if the engine's next `Inserted` answers a live insert: one that still splices.
+    pub fn insert_is_live(&self) -> bool {
+        matches!(self.pending_inserts.front(), Some(Some(_)))
+    }
+
+    /// True while a live insert or rearrange awaits the engine's answer.
+    pub fn settling(&self) -> bool {
+        self.pending_inserts.iter().any(Option::is_some)
+            || self.pending_rearranges.iter().any(Option::is_some)
     }
 
     fn opening(&mut self) {
@@ -151,16 +234,35 @@ impl NowPlaying {
             Event::Paused => self.paused = true,
             Event::Resumed => self.paused = false,
             Event::QueueFinished => {
+                self.end_pending();
                 self.badge = Badge::Idle;
                 self.index = None;
                 self.paused = false;
             }
+            Event::Inserted { at, .. } => {
+                if let Some(Some(items)) = self.pending_inserts.pop_front() {
+                    let at = (*at).min(self.queue.len());
+                    self.queue.splice(at..at, items);
+                }
+            }
             Event::DevicesChanged => {}
+            Event::Rearranged { .. } => {
+                // Only the rows the engine checked: tracks appended since stay after them.
+                if let Some(Some((from, len, items))) = self.pending_rearranges.pop_front() {
+                    let end = (from + len).min(self.queue.len());
+                    let from = from.min(end);
+                    self.queue.splice(from..end, items);
+                }
+            }
+            Event::RearrangeRefused { .. } => {
+                self.pending_rearranges.pop_front();
+            }
             Event::Underrun { total } => self.underruns = *total,
             Event::TrackError { path, error, .. } => {
                 self.track_errors.insert(path.clone(), error.to_string());
             }
             Event::Error(e) => {
+                self.end_pending();
                 self.fatal = Some(e.to_string());
                 self.badge = Badge::Idle;
                 self.paused = false;
@@ -217,6 +319,295 @@ mod tests {
             items: items(n),
             start,
         }
+    }
+
+    #[test]
+    fn append_extends_queue_without_moving_index() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(1, 0));
+        np.on_command(&PlayerCommand::Append { items: items(2) });
+        assert_eq!(np.queue.len(), 3);
+        assert_eq!(np.index, Some(0));
+    }
+
+    #[test]
+    fn append_when_idle_starts_the_queue() {
+        let mut np = NowPlaying::default();
+        np.on_command(&PlayerCommand::Append { items: items(2) });
+        assert_eq!(np.queue.len(), 2);
+        assert_eq!(np.index, Some(0));
+        assert_eq!(np.badge, Badge::Opening);
+    }
+
+    #[test]
+    fn append_after_a_fatal_error_replaces_the_queue() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(3, 1));
+        np.apply(&engine(Event::Error(EngineError::NoDevice)), t(1.0));
+        assert!(np.fatal.is_some());
+        np.on_command(&PlayerCommand::Append { items: items(2) });
+        assert_eq!(np.queue.len(), 2);
+        assert_eq!(np.index, Some(0));
+        assert!(np.fatal.is_none());
+    }
+
+    #[test]
+    fn append_after_queue_finished_replaces_the_queue() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(3, 0));
+        np.apply(&engine(Event::QueueFinished), t(2.0));
+        np.on_command(&PlayerCommand::Append { items: items(2) });
+        assert_eq!(np.queue.len(), 2);
+        assert_eq!(np.index, Some(0));
+    }
+
+    #[test]
+    fn append_of_nothing_changes_nothing() {
+        let mut np = NowPlaying::default();
+        np.on_command(&PlayerCommand::Append { items: vec![] });
+        assert!(np.queue.is_empty() && np.index.is_none());
+        np.on_command(&play(2, 1));
+        np.on_command(&PlayerCommand::Append { items: vec![] });
+        assert_eq!(np.queue.len(), 2);
+        assert_eq!(np.index, Some(1));
+    }
+
+    #[test]
+    fn insert_splices_at_the_reported_index() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(3, 0));
+        let mut x = items(1);
+        x[0].title = "x".into();
+        np.on_command(&PlayerCommand::Insert { items: x });
+        assert_eq!(np.queue.len(), 3);
+        np.apply(&engine(Event::Inserted { at: 2, count: 1 }), t(1.0));
+        assert_eq!(np.queue.len(), 4);
+        assert_eq!(np.queue[2].title, "x");
+        assert_eq!(np.queue[3].title, "t2");
+    }
+
+    #[test]
+    fn insert_when_stopped_starts_a_fresh_queue() {
+        let mut np = NowPlaying::default();
+        np.on_command(&PlayerCommand::Insert { items: items(2) });
+        assert_eq!(np.queue.len(), 2);
+        assert_eq!(np.index, Some(0));
+        assert_eq!(np.badge, Badge::Opening);
+    }
+
+    #[test]
+    fn play_between_insert_and_inserted_drops_the_pending_insert() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(3, 0));
+        np.on_command(&PlayerCommand::Insert { items: items(1) });
+        np.on_command(&play(2, 0));
+        np.apply(&engine(Event::Inserted { at: 1, count: 1 }), t(1.0));
+        assert_eq!(np.queue.len(), 2);
+    }
+
+    #[test]
+    fn stale_inserted_after_play_does_not_move_a_newer_insert() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(3, 0));
+        let mut a = items(1);
+        a[0].title = "a".into();
+        np.on_command(&PlayerCommand::Insert { items: a });
+        let mut r = items(3);
+        for (i, it) in r.iter_mut().enumerate() {
+            it.title = format!("r{i}");
+        }
+        np.on_command(&PlayerCommand::Play { items: r, start: 0 });
+        let mut b = items(1);
+        b[0].title = "b".into();
+        np.on_command(&PlayerCommand::Insert { items: b });
+        // The answer to the insert sent before the Play.
+        np.apply(&engine(Event::Inserted { at: 1, count: 1 }), t(1.0));
+        assert_eq!(titles(&np), ["r0", "r1", "r2"]);
+        assert!(np.settling());
+        np.apply(&engine(Event::Inserted { at: 2, count: 1 }), t(1.0));
+        assert_eq!(titles(&np), ["r0", "r1", "b", "r2"]);
+        assert!(!np.settling());
+    }
+
+    fn titled(prefix: &str, n: usize) -> Vec<QueueItem> {
+        let mut v = items(n);
+        for (i, it) in v.iter_mut().enumerate() {
+            it.title = format!("{prefix}{i}");
+        }
+        v
+    }
+
+    #[test]
+    fn inserts_unanswered_when_the_queue_finishes_are_dropped() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(3, 0));
+        np.on_command(&PlayerCommand::Insert { items: items(1) });
+        // The engine had finished: it plays that insert afresh and never answers it.
+        np.apply(&engine(Event::QueueFinished), t(1.0));
+        assert!(!np.settling());
+        np.on_command(&PlayerCommand::Play {
+            items: titled("r", 3),
+            start: 0,
+        });
+        np.on_command(&PlayerCommand::Insert {
+            items: titled("b", 1),
+        });
+        np.apply(&engine(Event::Inserted { at: 1, count: 1 }), t(2.0));
+        assert_eq!(titles(&np), ["r0", "b0", "r1", "r2"]);
+        assert!(!np.settling());
+    }
+
+    #[test]
+    fn inserts_unanswered_at_a_fatal_error_are_dropped() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(3, 0));
+        np.on_command(&PlayerCommand::Insert { items: items(1) });
+        np.apply(&engine(Event::Error(EngineError::NoDevice)), t(1.0));
+        assert!(!np.settling());
+        np.on_command(&PlayerCommand::Play {
+            items: titled("r", 3),
+            start: 0,
+        });
+        np.on_command(&PlayerCommand::Insert {
+            items: titled("b", 1),
+        });
+        np.apply(&engine(Event::Inserted { at: 1, count: 1 }), t(2.0));
+        assert_eq!(titles(&np), ["r0", "b0", "r1", "r2"]);
+    }
+
+    #[test]
+    fn insert_after_stop_keeps_the_stale_answers_in_line() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(3, 1));
+        np.on_command(&PlayerCommand::Insert { items: items(1) });
+        np.on_command(&PlayerCommand::Stop);
+        np.on_command(&PlayerCommand::Insert {
+            items: titled("b", 2),
+        });
+        np.on_command(&PlayerCommand::Insert {
+            items: titled("c", 1),
+        });
+        // The engine answered the first insert before it stopped.
+        np.apply(&engine(Event::Inserted { at: 2, count: 1 }), t(1.0));
+        assert_eq!(titles(&np), ["b0", "b1"]);
+        assert!(np.settling());
+        np.apply(&engine(Event::Inserted { at: 1, count: 1 }), t(1.0));
+        assert_eq!(titles(&np), ["b0", "c0", "b1"]);
+        assert!(!np.settling());
+    }
+
+    #[test]
+    fn inserted_with_nothing_pending_is_ignored() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(2, 0));
+        np.apply(&engine(Event::Inserted { at: 1, count: 1 }), t(1.0));
+        assert_eq!(np.queue.len(), 2);
+    }
+
+    fn titles(np: &NowPlaying) -> Vec<String> {
+        np.queue.iter().map(|i| i.title.clone()).collect()
+    }
+
+    fn rearrange(from: usize, expected: Vec<QueueItem>, items: Vec<QueueItem>) -> PlayerCommand {
+        PlayerCommand::Rearrange {
+            from,
+            expected,
+            items,
+        }
+    }
+
+    #[test]
+    fn rearranged_splices_from_from() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(4, 0));
+        let q = np.queue.clone();
+        np.on_command(&rearrange(1, q[1..].to_vec(), vec![q[3].clone()]));
+        assert_eq!(titles(&np), ["x", "t1", "t2", "t3"]);
+        np.apply(&engine(Event::Rearranged { from: 1 }), t(1.0));
+        assert_eq!(titles(&np), ["x", "t3"]);
+    }
+
+    #[test]
+    fn rearranged_keeps_tracks_appended_after_it_was_sent() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(4, 0));
+        let q = np.queue.clone();
+        np.on_command(&rearrange(1, q[1..].to_vec(), vec![q[3].clone()]));
+        let mut y = items(1);
+        y[0].title = "y".into();
+        np.on_command(&PlayerCommand::Append { items: y });
+        np.apply(&engine(Event::Rearranged { from: 1 }), t(1.0));
+        assert_eq!(titles(&np), ["x", "t3", "y"]);
+    }
+
+    #[test]
+    fn refused_leaves_the_queue() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(4, 0));
+        let q = np.queue.clone();
+        np.on_command(&rearrange(1, q[1..].to_vec(), vec![q[3].clone()]));
+        np.apply(
+            &engine(Event::RearrangeRefused {
+                from: 1,
+                reason: bp_engine::RearrangeRefusal::Changed,
+            }),
+            t(1.0),
+        );
+        assert_eq!(titles(&np), ["x", "t1", "t2", "t3"]);
+        assert!(!np.settling());
+    }
+
+    #[test]
+    fn inserts_and_rearranges_follow_their_events() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(4, 0));
+        let q = np.queue.clone();
+        let mut x = items(1);
+        x[0].title = "y".into();
+        np.on_command(&rearrange(1, q[1..].to_vec(), vec![q[3].clone()]));
+        np.on_command(&PlayerCommand::Insert { items: x });
+        np.apply(&engine(Event::Rearranged { from: 1 }), t(1.0));
+        assert_eq!(titles(&np), ["x", "t3"]);
+        assert!(np.settling());
+        np.apply(&engine(Event::Inserted { at: 1, count: 1 }), t(1.0));
+        assert_eq!(titles(&np), ["x", "y", "t3"]);
+    }
+
+    #[test]
+    fn stale_rearranged_after_play_does_not_touch_the_new_queue() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(4, 0));
+        let q = np.queue.clone();
+        np.on_command(&rearrange(1, q[1..].to_vec(), vec![q[3].clone()]));
+        let mut r = items(3);
+        for (i, it) in r.iter_mut().enumerate() {
+            it.title = format!("r{i}");
+        }
+        np.on_command(&PlayerCommand::Play {
+            items: r.clone(),
+            start: 0,
+        });
+        np.on_command(&rearrange(1, r[1..].to_vec(), vec![r[2].clone()]));
+        np.apply(&engine(Event::Rearranged { from: 1 }), t(1.0));
+        assert_eq!(titles(&np), ["r0", "r1", "r2"]);
+        np.apply(&engine(Event::Rearranged { from: 1 }), t(1.0));
+        assert_eq!(titles(&np), ["r0", "r2"]);
+    }
+
+    #[test]
+    fn settling_while_anything_is_pending() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(3, 0));
+        assert!(!np.settling());
+        np.on_command(&PlayerCommand::Insert { items: items(1) });
+        assert!(np.settling());
+        np.apply(&engine(Event::Inserted { at: 1, count: 1 }), t(1.0));
+        assert!(!np.settling());
+        let q = np.queue.clone();
+        np.on_command(&rearrange(1, q[1..].to_vec(), vec![]));
+        assert!(np.settling());
+        np.on_command(&PlayerCommand::Stop);
+        assert!(!np.settling());
     }
 
     fn engine(ev: Event) -> PlayerEvent {
@@ -454,6 +845,18 @@ mod tests {
         np.apply(&engine(Event::Error(EngineError::NoDevice)), t(2.0));
         np.on_command(&reprobe);
         assert_eq!(np.badge, Badge::Idle);
+    }
+
+    #[test]
+    fn set_dop_while_playing_leaves_the_stream_alone() {
+        let mut np = NowPlaying::default();
+        np.on_command(&play(2, 0));
+        np.apply(&started(0, PathKind::Dop), t(0.3));
+        np.on_command(&PlayerCommand::SetDop {
+            id: bp_core::DeviceId("dac-a".into()),
+            enabled: false,
+        });
+        assert_eq!(np.badge, Badge::BitPerfect);
     }
 
     #[test]

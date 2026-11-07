@@ -4,16 +4,22 @@
 use std::time::Duration;
 
 use egui::{
-    Color32, CornerRadius, FontId, Pos2, Rect, Role, Sense, Stroke, Ui, UiBuilder, WidgetInfo, vec2,
+    Color32, CornerRadius, FontId, Popup, Pos2, Rect, Role, Sense, Stroke, Ui, UiBuilder,
+    WidgetInfo, vec2,
 };
 
 use crate::art::{ArtKind, ArtLoader};
 use crate::backend::Album;
 use crate::fmt::duration;
+use crate::queue_edit;
 use crate::state::now_playing::{Badge, NowPlaying};
-use crate::theme::{BAR, bold, semibold};
+use crate::state::selection::{ListId, Selection};
+use crate::theme::{BAR, TEXT, TEXT_2, bold, semibold};
+use crate::views::art_row::{self, ArtRow, DIM};
 use crate::views::bar::{Icon, fatal_line, format_line, icon_button, seek_line};
-use crate::views::{paint_art_rounded, shadow, text_at, truncated, window_controls};
+use crate::views::context_menu::{self, MenuPlace, MenuSpec, RowAction};
+use crate::views::track_list::{RowDrag, pill};
+use crate::views::{paint_art_rounded, shadow, shown_text, text_at, truncated, window_controls};
 
 const COLUMN: f32 = 440.0;
 const MAX_COVER: f32 = 380.0;
@@ -21,19 +27,31 @@ const MIN_COVER: f32 = 160.0;
 /// Height the column needs under the cover at its smallest.
 const BELOW_COVER: f32 = 340.0;
 const SPECTRUM_MAX: f32 = 72.0;
-const QUEUE_ROW: f32 = 50.0;
+const QUEUE_ROW: f32 = art_row::ROW_H;
+/// Space between queue rows.
+const QUEUE_SPACING: f32 = 2.0;
+/// Height under the queue list for the Save button.
+const SAVE_STRIP: f32 = 48.0;
 /// Height of the window strip at the top: drag area and window buttons.
 const WINDOW_STRIP: f32 = 40.0;
-const DIM: Color32 = Color32::from_rgba_premultiplied(190, 190, 190, 190);
 const TRACK: Color32 = Color32::from_rgba_premultiplied(56, 56, 56, 56);
 
 pub struct NowPlayingData<'a> {
     pub np: &'a NowPlaying,
-    /// The album the queue was started from.
+    /// The playing track's album.
     pub album: Option<&'a Album>,
+    /// The album the queue was started from.
+    pub queue_album: Option<&'a Album>,
+    /// Each queued track's album, by queue index.
+    pub row_albums: &'a [Option<Album>],
     pub device: Option<&'a str>,
     /// Large spectrum levels while playing.
     pub spectrum: Option<&'a [f32]>,
+    pub selection: &'a Selection,
+    pub playlists: &'a [String],
+    pub device_ready: bool,
+    /// The app's notice and whether it offers Undo (the bar is hidden here).
+    pub notice: Option<(&'a str, bool)>,
 }
 
 pub enum NowPlayingAction {
@@ -42,9 +60,15 @@ pub enum NowPlayingAction {
     Previous,
     Next,
     Seek(Duration),
-    /// Play the queue from this index.
-    PlayIndex(usize),
+    /// A click, double-click or menu choice on a queue row.
+    Row(RowAction),
     Retry,
+    /// Save the queue as a playlist.
+    SaveQueue,
+    /// Remove every upcoming track.
+    ClearUpcoming,
+    /// The notice's Undo.
+    Undo,
 }
 
 /// The cover's side for a window of `available`: as large as 380 px while the controls
@@ -189,10 +213,14 @@ pub fn show(ui: &mut Ui, data: &NowPlayingData, art: &mut ArtLoader) -> Option<N
 
     // The queue.
     let queue = Rect::from_min_max(Pos2::new(col.right() + 64.0, content.top()), content.max);
-    if queue.width() > 120.0
-        && let Some(i) = queue_list(ui, queue, data, art)
-    {
-        action = Some(NowPlayingAction::PlayIndex(i));
+    if queue.width() > 120.0 {
+        match queue_list(ui, queue, data, art) {
+            Some(QueueClick::Row(a)) => action = Some(NowPlayingAction::Row(a)),
+            Some(QueueClick::Save) => action = Some(NowPlayingAction::SaveQueue),
+            Some(QueueClick::Clear) => action = Some(NowPlayingAction::ClearUpcoming),
+            Some(QueueClick::Undo) => action = Some(NowPlayingAction::Undo),
+            None => {}
+        }
     }
     action
 }
@@ -238,100 +266,199 @@ fn badge_pill(ui: &mut Ui, line: Rect, badge: &Badge, format: &str) {
     text_at(ui, Pos2::new(line.left() + lw + 10.0, cy - fh / 2.0), fmt);
 }
 
-/// "QUEUE · album" and one row per queued track; returns the row clicked.
+enum QueueClick {
+    Row(RowAction),
+    Save,
+    Clear,
+    Undo,
+}
+
+/// "QUEUE · album" with the notice on its right, one row per queued track and the Save
+/// and Clear upcoming buttons under them; returns what was clicked.
 fn queue_list(
     ui: &mut Ui,
     rect: Rect,
     data: &NowPlayingData,
     art: &mut ArtLoader,
-) -> Option<usize> {
+) -> Option<QueueClick> {
     let mut clicked = None;
     let np = data.np;
     ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-        let header = match data.album {
+        let header = match data.queue_album {
             Some(a) => format!("QUEUE · {}", a.title.to_uppercase()),
             None => "QUEUE".to_owned(),
+        };
+        let (r, _) = ui.allocate_exact_size(vec2(rect.width(), 28.0), Sense::hover());
+        let notice_w = match data.notice {
+            Some((text, undo)) => {
+                let (w, undo_clicked) = notice(ui, r, text, undo);
+                if undo_clicked {
+                    clicked = Some(QueueClick::Undo);
+                }
+                w + 24.0
+            }
+            None => 0.0,
         };
         let g = truncated(
             ui,
             &header,
             FontId::new(12.0, semibold()),
             DIM,
-            rect.width(),
+            (rect.width() - notice_w).max(0.0),
         );
-        let (r, _) = ui.allocate_exact_size(vec2(rect.width(), 28.0), Sense::hover());
         text_at(ui, Pos2::new(r.left() + 12.0, r.top()), g);
-        let thumb = data
-            .album
-            .map(|a| (a, art.texture(ui.ctx(), a.id, ArtKind::Thumb)));
         egui::ScrollArea::vertical()
             .id_salt("np_queue")
+            .max_height((ui.available_height() - SAVE_STRIP).max(0.0))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.spacing_mut().item_spacing.y = QUEUE_SPACING;
+                let shown: Vec<usize> = (0..np.queue.len()).collect();
+                let tail = if np.fatal.is_none() {
+                    queue_edit::tail(&np.queue, np.index)
+                } else {
+                    None
+                };
+                // Only upcoming rows drag; the drop's gap is a queue row (0..=len).
+                let mut drag = RowDrag::begin(ui.ctx(), tail.is_some());
+                let mut list_rect = Rect::NOTHING;
                 for (i, item) in np.queue.iter().enumerate() {
-                    let (row, resp) = ui
-                        .allocate_exact_size(vec2(ui.available_width(), QUEUE_ROW), Sense::click());
+                    let drags = tail.as_ref().is_some_and(|t| i >= t.from);
+                    let sense = if drags {
+                        Sense::click_and_drag()
+                    } else {
+                        Sense::click()
+                    };
+                    let (row, resp) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), QUEUE_ROW), sense);
+                    list_rect = list_rect.union(row);
                     resp.widget_info(|| WidgetInfo::labeled(Role::ListItem, true, &item.title));
-                    if resp.clicked() {
-                        clicked = Some(i);
+                    // The counts cost a pass over the queue, so only a row whose menu
+                    // can show this frame works them out.
+                    let menu_may_show = resp.secondary_clicked()
+                        || resp.has_focus()
+                        || Popup::is_id_open(ui.ctx(), Popup::default_response_id(&resp));
+                    let (upcoming, play_next) = if menu_may_show {
+                        let target = data.selection.target(&ListId::Queue, &shown, i);
+                        queue_edit::counts(tail.as_ref(), &target)
+                    } else {
+                        (0, false)
+                    };
+                    let spec = MenuSpec {
+                        place: MenuPlace::QueueRow {
+                            upcoming,
+                            play_next,
+                        },
+                        count: 0,
+                        playlists: data.playlists,
+                        exclude: None,
+                        device_ready: data.device_ready,
+                    };
+                    if let Some(a) =
+                        context_menu::row(&resp, &ListId::Queue, &shown, i, data.selection, spec)
+                    {
+                        clicked = Some(QueueClick::Row(a));
+                    }
+                    let selected = data.selection.is_selected(&ListId::Queue, i);
+                    if drags {
+                        let target = || data.selection.target(&ListId::Queue, &shown, i);
+                        if let Some(a) = drag.row(&resp, i, selected, target)
+                            && clicked.is_none()
+                        {
+                            clicked = Some(QueueClick::Row(a));
+                        }
                     }
                     if !ui.is_rect_visible(row) {
                         continue;
                     }
-                    let current = np.index == Some(i);
-                    let played = np.index.is_some_and(|c| i < c);
-                    let p = ui.painter();
-                    if current {
-                        p.rect_filled(row, CornerRadius::same(6), Color32::from_white_alpha(40));
-                    } else if resp.hovered() {
-                        p.rect_filled(row, CornerRadius::same(6), Color32::from_white_alpha(18));
-                    }
-                    let alpha = if played { 0.55 } else { 1.0 };
-                    let th = Rect::from_min_size(row.min + vec2(12.0, 7.0), vec2(36.0, 36.0));
-                    if let Some((album, state)) = &thumb {
-                        paint_art_rounded(p, th, state, &album.title, 3.0);
-                        if played {
-                            p.rect_filled(
-                                th,
-                                CornerRadius::same(3),
-                                Color32::from_black_alpha(110),
-                            );
-                        }
-                    }
-                    let x = th.right() + 14.0;
-                    let time_w = 56.0;
-                    let w = (row.right() - time_w - 12.0 - x).max(0.0);
-                    let font = if current {
-                        FontId::new(14.0, semibold())
-                    } else {
-                        FontId::proportional(14.0)
+                    let album = data.row_albums.get(i).and_then(Option::as_ref);
+                    let time = duration(item.duration);
+                    let r = ArtRow {
+                        title: &item.title,
+                        artist: album.map_or("", |a| a.artist.as_str()),
+                        time: &time,
+                        album,
+                        current: np.index == Some(i),
+                        selected,
+                        dim: np.index.is_some_and(|c| i < c),
                     };
-                    let white = Color32::WHITE.gamma_multiply(alpha);
-                    let title = truncated(ui, &item.title, font, white, w);
-                    let artist = data.album.map_or("", |a| a.artist.as_str());
-                    let sub = truncated(
-                        ui,
-                        artist,
-                        FontId::proportional(12.0),
-                        DIM.gamma_multiply(alpha),
-                        w,
-                    );
-                    let p = ui.painter();
-                    let cy = row.center().y;
-                    p.galley(Pos2::new(x, cy - title.size().y), title, white);
-                    p.galley(Pos2::new(x, cy + 1.0), sub, DIM);
-                    p.text(
-                        Pos2::new(row.right() - 12.0, cy),
-                        egui::Align2::RIGHT_CENTER,
-                        duration(item.duration),
-                        FontId::monospace(12.0),
-                        DIM.gamma_multiply(alpha),
-                    );
+                    art_row::paint(ui, row, resp.hovered(), &r, art);
+                }
+                // No bar here: the scroll area's own clip is what can be seen.
+                let pitch = QUEUE_ROW + QUEUE_SPACING;
+                if let Some(a) = drag.finish(ui, list_rect, np.queue.len(), pitch, 0.0) {
+                    clicked = Some(QueueClick::Row(a));
                 }
             });
+        ui.add_space(12.0);
+        let upcoming = np.fatal.is_none()
+            && queue_edit::tail(&np.queue, np.index).is_some_and(|t| !t.rows.is_empty());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            if pill(
+                ui,
+                "Save queue as playlist…",
+                "Save queue as playlist…",
+                false,
+            )
+            .clicked()
+            {
+                clicked = Some(QueueClick::Save);
+            }
+            if upcoming && pill(ui, "Clear upcoming", "Clear upcoming", false).clicked() {
+                clicked = Some(QueueClick::Clear);
+            }
+        });
     });
     clicked
+}
+
+/// The notice right-aligned in the header row `r`, in the bar's style, with Undo after
+/// it when `undo`; its width, and whether Undo was clicked. It takes no space.
+fn notice(ui: &mut Ui, r: Rect, text: &str, undo: bool) -> (f32, bool) {
+    let undo_w = if undo { 48.0 } else { 0.0 };
+    let g = truncated(
+        ui,
+        text,
+        FontId::monospace(12.0),
+        TEXT_2,
+        r.width() * 0.6 - undo_w,
+    );
+    let total = g.size().x + undo_w;
+    let left = r.right() - 12.0 - total;
+    // Centred on the header text's line, which sits at the top of the row.
+    let header_h = ui
+        .painter()
+        .layout_no_wrap("Q".to_owned(), FontId::new(12.0, semibold()), DIM)
+        .size()
+        .y;
+    let line_y = r.top() + header_h / 2.0;
+    let pos = Pos2::new(left, line_y - g.size().y / 2.0);
+    let text_rect = Rect::from_min_size(pos, g.size());
+    let shown = shown_text(&g);
+    let resp = ui.interact(text_rect, ui.scope_id().with("np_notice"), Sense::hover());
+    resp.widget_info(|| WidgetInfo::labeled(Role::Status, true, &shown));
+    let text_w = g.size().x;
+    ui.painter().galley(pos, g, Color32::PLACEHOLDER);
+    let mut clicked = false;
+    if undo {
+        let rect = Rect::from_min_size(
+            Pos2::new(left + text_w + 12.0, line_y - 9.0),
+            vec2(undo_w - 12.0, 18.0),
+        );
+        let resp = ui.interact(rect, ui.scope_id().with("np_undo"), Sense::click());
+        resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Undo"));
+        let color = if resp.hovered() { TEXT } else { TEXT_2 };
+        let u = truncated(ui, "Undo", FontId::monospace(12.0), color, rect.width());
+        let h = u.size().y;
+        ui.painter().galley(
+            Pos2::new(rect.left(), line_y - h / 2.0),
+            u,
+            Color32::PLACEHOLDER,
+        );
+        clicked = resp.clicked();
+    }
+    (total, clicked)
 }
 
 #[cfg(test)]

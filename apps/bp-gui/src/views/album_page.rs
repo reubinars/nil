@@ -5,15 +5,18 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, FontId, Id, Key, Layout, Pos2, Rect, Response, Role,
-    Sense, Shape, Stroke, StrokeKind, Ui, WidgetInfo, vec2,
+    Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rect, Response, Role, Sense, Shape,
+    Stroke, StrokeKind, Ui, WidgetInfo, vec2,
 };
 
 use crate::art::{ArtKind, ArtLoader, ArtState};
-use crate::backend::{Album, ArtistId, DeviceCaps, Track, TrackId};
+use crate::backend::{Album, ArtistId, DeviceCaps, Track};
 use crate::fmt::{duration, short_format};
+use crate::state::selection::{ListId, Selection};
 use crate::state::support::track_support;
-use crate::theme::{BORDER, HOVER, TEXT, TEXT_2, TEXT_3, WINDOW, bold, semibold};
+use crate::theme::{BORDER, HOVER, SELECTED, TEXT, TEXT_2, TEXT_3, WINDOW, bold, semibold};
+use crate::views::context_menu::{self, MenuPlace, MenuSpec, RowAction};
+use crate::views::track_list::{ON_WHITE, white_fill};
 use crate::views::{gradient_rect, paint_art_rounded, shadow, text_at, truncated};
 
 const ART: f32 = 260.0;
@@ -24,14 +27,18 @@ const ICON_W: f32 = 18.0;
 const FORMAT_W: f32 = 110.0;
 const DURATION_W: f32 = 60.0;
 const PLAY_HEIGHT: f32 = 44.0;
-/// Text on a white Play button.
-const ON_WHITE: Color32 = Color32::from_rgb(0x11, 0x11, 0x11);
-
 pub struct PageData<'a> {
     pub album: &'a Album,
     /// Disc, then track order.
     pub tracks: &'a [Track],
-    pub highlight: Option<TrackId>,
+    /// Rows are track indices into `tracks`.
+    pub selection: &'a Selection,
+    /// Scroll this track index into view (once, on arriving from search).
+    pub reveal: Option<usize>,
+    /// Playlist names for the menu's "Add to playlist".
+    pub playlists: &'a [String],
+    /// An output device is selected and present.
+    pub device_ready: bool,
     /// The track now playing.
     pub playing: Option<&'a Path>,
     /// The selected device's name and capabilities; with none, no track is marked
@@ -41,7 +48,8 @@ pub struct PageData<'a> {
 }
 
 pub enum PageAction {
-    Select(TrackId),
+    /// A track row was clicked, activated or its menu used; rows are track indices.
+    Row(RowAction),
     /// Play the album from this track index.
     Play(usize),
     OpenArtist(ArtistId),
@@ -194,7 +202,7 @@ fn facts(ui: &mut Ui, data: &PageData) {
 
 /// The white pill that plays the album from its first track.
 fn play_button(ui: &mut Ui) -> Response {
-    let (fill, fg) = (TEXT, ON_WHITE);
+    let fg = ON_WHITE;
     let label = ui
         .painter()
         .layout_no_wrap("Play".into(), FontId::new(14.0, semibold()), fg);
@@ -202,11 +210,7 @@ fn play_button(ui: &mut Ui) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(width, PLAY_HEIGHT), Sense::click());
     resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Play album"));
     let p = ui.painter();
-    let fill = if resp.hovered() {
-        fill.gamma_multiply(0.9)
-    } else {
-        fill
-    };
+    let fill = white_fill(resp.hovered());
     p.rect_filled(rect, CornerRadius::same((PLAY_HEIGHT / 2.0) as u8), fill);
     let cy = rect.center().y;
     let x = rect.left() + 24.0;
@@ -231,6 +235,8 @@ fn tracklist(ui: &mut Ui, data: &PageData) -> Option<PageAction> {
         .is_some_and(|first| data.tracks.iter().any(|t| t.disc != first.disc));
     column_header(ui);
     ui.spacing_mut().item_spacing.y = 0.0;
+    let list = ListId::Album(data.album.id);
+    let shown: Vec<usize> = (0..data.tracks.len()).collect();
     let mut disc = None;
     for (i, t) in data.tracks.iter().enumerate() {
         if multi_disc && disc != Some(t.disc) {
@@ -243,12 +249,20 @@ fn tracklist(ui: &mut Ui, data: &PageData) -> Option<PageAction> {
             );
             ui.add_space(6.0);
         }
-        let resp = track_row(ui, data, t);
-        let enter = resp.has_focus() && ui.input(|inp| inp.key_pressed(Key::Enter));
-        if resp.double_clicked() || enter {
-            action = Some(PageAction::Play(i));
-        } else if resp.clicked() {
-            action = Some(PageAction::Select(t.id));
+        let selected = data.selection.is_selected(&list, i);
+        let resp = track_row(ui, data, t, selected);
+        if data.reveal == Some(i) {
+            resp.scroll_to_me(Some(Align::Center));
+        }
+        let spec = MenuSpec {
+            place: MenuPlace::Track { search: false },
+            count: 0,
+            playlists: data.playlists,
+            exclude: None,
+            device_ready: data.device_ready,
+        };
+        if let Some(a) = context_menu::row(&resp, &list, &shown, i, data.selection, spec) {
+            action = Some(PageAction::Row(a));
         }
     }
     action
@@ -278,7 +292,7 @@ fn column_header(ui: &mut Ui) {
     ui.add_space(4.0);
 }
 
-fn track_row(ui: &mut Ui, data: &PageData, t: &Track) -> Response {
+fn track_row(ui: &mut Ui, data: &PageData, t: &Track, selected: bool) -> Response {
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
     resp.widget_info(|| WidgetInfo::labeled(Role::ListItem, true, &t.title));
@@ -304,27 +318,12 @@ fn track_row(ui: &mut Ui, data: &PageData, t: &Track) -> Response {
         return resp;
     }
 
-    if data.highlight == Some(t.id) {
-        // Scroll the highlighted track into view once, when it first shows.
-        let key = Id::unique("album_page_highlight_shown");
-        let shown = ui.data(|d| d.get_temp::<TrackId>(key));
-        if shown != Some(t.id) {
-            resp.scroll_to_me(Some(Align::Center));
-            ui.data_mut(|d| d.insert_temp(key, t.id));
-        }
-    }
     let p = ui.painter();
     let playing = data.playing == Some(t.path.as_path());
-    if resp.hovered() || playing {
+    if selected {
+        p.rect_filled(rect, CornerRadius::same(4), SELECTED);
+    } else if resp.hovered() || playing {
         p.rect_filled(rect, CornerRadius::same(4), HOVER);
-    }
-    if data.highlight == Some(t.id) {
-        p.rect_stroke(
-            rect,
-            CornerRadius::same(4),
-            Stroke::new(1.0, Color32::WHITE),
-            StrokeKind::Inside,
-        );
     }
     let cy = rect.center().y;
     let mono = FontId::monospace(12.0);

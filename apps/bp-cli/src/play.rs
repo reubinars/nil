@@ -147,7 +147,11 @@ fn handle_event(ev: Event, st: &mut State, device_name: &str) -> Option<u8> {
             line(true, &format!("error: {e}"));
             return Some(1);
         }
-        Event::DevicesChanged => {}
+        // The CLI never sends `Insert` or `Rearrange`.
+        Event::DevicesChanged
+        | Event::Inserted { .. }
+        | Event::Rearranged { .. }
+        | Event::RearrangeRefused { .. } => {}
         Event::QueueFinished => return Some(0),
     }
     None

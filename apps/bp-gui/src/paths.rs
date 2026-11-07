@@ -1,18 +1,15 @@
-use std::path::PathBuf;
+use std::sync::OnceLock;
 
-/// Directory holding `gui.toml`, `library.toml` and the engine's `devices.toml`.
-/// Does not create it.
-pub fn config_dir() -> PathBuf {
-    bp_engine::profile::default_dir()
+use bp_engine::home::Home;
+
+static HOME: OnceLock<Home> = OnceLock::new();
+
+/// Stores the resolved home. `main` calls this once, first; later calls are ignored.
+pub fn set_home(home: Home) {
+    let _ = HOME.set(home);
 }
 
-/// Thumbnail cache directory. Does not create it.
-pub fn thumbs_dir() -> PathBuf {
-    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(base).join("bitperfect").join("thumbs");
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join(".cache").join("bitperfect").join("thumbs")
+/// The resolved home. Panics if `main` has not called [`set_home`].
+pub fn home() -> &'static Home {
+    HOME.get().expect("paths::set_home was not called")
 }

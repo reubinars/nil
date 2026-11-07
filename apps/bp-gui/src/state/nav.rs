@@ -1,6 +1,6 @@
 //! Browser-style page history: back and forward stacks of pages with their scroll offsets.
 
-use crate::backend::{AlbumId, ArtistId, LibrarySource, TrackId};
+use crate::backend::{AlbumId, ArtistId, LibrarySource};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Page {
@@ -11,18 +11,25 @@ pub enum Page {
     Artist(ArtistId),
     Album {
         album: AlbumId,
-        highlight: Option<TrackId>,
     },
     Search(String),
     Settings,
+    Playlists,
+    /// One playlist, by name.
+    Playlist(String),
+    /// A plugin's panel, by plugin folder name.
+    Plugin(String),
 }
 
 /// The top bar's tabs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tab {
     Home,
     Albums,
     Artists,
+    Playlists,
+    /// A plugin's panel, by plugin folder name.
+    Plugin(String),
 }
 
 /// Most pages kept behind the current one.
@@ -134,15 +141,67 @@ impl Nav {
     pub fn tab(&self) -> Option<Tab> {
         let pages = std::iter::once(&self.current).chain(self.back.iter().rev());
         for e in pages {
-            match e.page {
+            match &e.page {
                 Page::Home => return Some(Tab::Home),
                 Page::Albums => return Some(Tab::Albums),
                 Page::Artists | Page::Artist(_) => return Some(Tab::Artists),
+                Page::Playlists | Page::Playlist(_) => return Some(Tab::Playlists),
+                Page::Plugin(id) => return Some(Tab::Plugin(id.clone())),
                 Page::Search(_) | Page::Settings => return None,
                 Page::Album { .. } => {}
             }
         }
         None
+    }
+
+    /// The playlist `from` is now `to`: history follows it.
+    pub fn rename_playlist(&mut self, from: &str, to: &str) {
+        let renamed = Page::Playlist(to.to_owned());
+        for e in self.entries_mut() {
+            if matches!(&e.page, Page::Playlist(n) if n == from) {
+                e.page = renamed.clone();
+            }
+        }
+        self.dedup();
+    }
+
+    /// The playlist `name` is gone: its pages leave the history, and if it was the
+    /// current page, the Playlists list takes its place.
+    pub fn drop_playlist(&mut self, name: &str) {
+        let gone = |p: &Page| matches!(p, Page::Playlist(n) if n == name);
+        self.back.retain(|e| !gone(&e.page));
+        self.forward.retain(|e| !gone(&e.page));
+        if gone(&self.current.page) {
+            self.current = Entry::new(Page::Playlists);
+        }
+        self.dedup();
+    }
+
+    /// The plugin `id` has no panel any more: its pages leave the history, and if it was
+    /// the current page, Home takes its place.
+    pub fn drop_plugin(&mut self, id: &str) {
+        let gone = |p: &Page| matches!(p, Page::Plugin(n) if n == id);
+        self.back.retain(|e| !gone(&e.page));
+        self.forward.retain(|e| !gone(&e.page));
+        if gone(&self.current.page) {
+            self.current = Entry::new(Page::Home);
+        }
+        self.dedup();
+    }
+
+    fn entries_mut(&mut self) -> impl Iterator<Item = &mut Entry> {
+        let current = std::iter::once(&mut self.current);
+        self.back.iter_mut().chain(current).chain(&mut self.forward)
+    }
+
+    /// Merges neighbouring entries for the same page, so Back always moves somewhere.
+    fn dedup(&mut self) {
+        self.back.dedup_by(|a, b| a.page == b.page);
+        self.forward.dedup_by(|a, b| a.page == b.page);
+        if let Some(prev) = self.back.pop_if(|e| e.page == self.current.page) {
+            self.current.scroll = prev.scroll;
+        }
+        self.forward.pop_if(|e| e.page == self.current.page);
     }
 
     /// Drops every page whose artist or album no longer exists (after a rescan). A dropped
@@ -230,6 +289,98 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_playlist_leaves_history_without_doubled_pages() {
+        let pl = |n: &str| Page::Playlist(n.into());
+        let mut n = Nav::default();
+        n.open(Page::Playlists, 7.0);
+        n.open(pl("a"), 0.0);
+        n.open(Page::Playlists, 0.0);
+        n.open(pl("b"), 0.0);
+        n.drop_playlist("b");
+        assert_eq!(n.current(), &Page::Playlists);
+        n.drop_playlist("a");
+        assert!(n.back(0.0));
+        assert_eq!(n.current(), &Page::Home);
+        assert!(n.forward(0.0));
+        assert_eq!(n.current(), &Page::Playlists);
+        assert!(!n.can_forward());
+    }
+
+    #[test]
+    fn dropping_playlists_between_list_entries_merges_them_across_drops() {
+        let pl = |n: &str| Page::Playlist(n.into());
+        let mut n = Nav::default();
+        n.open(Page::Playlists, 0.0);
+        n.open(pl("a"), 0.0);
+        n.open(Page::Playlists, 0.0);
+        n.open(pl("b"), 0.0);
+        n.open(Page::Playlists, 0.0);
+        n.drop_playlist("a");
+        n.drop_playlist("b");
+        // Home, Playlists: the three list entries became one.
+        assert!(n.back(0.0));
+        assert_eq!(n.current(), &Page::Home);
+        assert!(!n.can_back());
+        assert!(n.forward(0.0));
+        assert_eq!(n.current(), &Page::Playlists);
+        assert!(!n.can_forward());
+    }
+
+    #[test]
+    fn renaming_into_a_neighbour_name_merges_entries() {
+        let pl = |n: &str| Page::Playlist(n.into());
+        let mut n = Nav::default();
+        n.open(pl("a"), 0.0);
+        n.open(pl("b"), 0.0);
+        n.rename_playlist("a", "b");
+        assert_eq!(n.current(), &pl("b"));
+        assert!(n.back(0.0));
+        assert_eq!(n.current(), &Page::Home);
+    }
+
+    #[test]
+    fn a_renamed_playlist_is_renamed_in_history() {
+        let mut n = Nav::default();
+        n.open(Page::Playlist("a".into()), 0.0);
+        n.open(Page::Playlists, 0.0);
+        n.open(Page::Playlist("b".into()), 0.0);
+        n.rename_playlist("b", "c");
+        assert_eq!(n.current(), &Page::Playlist("c".into()));
+        n.back(0.0);
+        n.back(0.0);
+        assert_eq!(n.current(), &Page::Playlist("a".into()));
+    }
+
+    #[test]
+    fn a_dropped_plugin_leaves_history_without_doubled_pages() {
+        let pl = || Page::Plugin("dj".into());
+        let mut n = Nav::default();
+        n.open(pl(), 0.0);
+        n.open(Page::Settings, 0.0);
+        n.open(pl(), 0.0);
+        assert_eq!(n.tab(), Some(Tab::Plugin("dj".into())));
+        n.drop_plugin("dj");
+        // Home, Settings, then Home in place of the dropped page.
+        assert_eq!(n.current(), &Page::Home);
+        assert!(n.back(0.0));
+        assert_eq!(n.current(), &Page::Settings);
+        assert!(n.back(0.0));
+        assert_eq!(n.current(), &Page::Home);
+        assert!(!n.can_back());
+
+        // Dropped from behind the current page: neighbours merge.
+        let mut n = Nav::default();
+        n.open(Page::Settings, 0.0);
+        n.open(pl(), 0.0);
+        n.open(Page::Settings, 0.0);
+        n.drop_plugin("dj");
+        assert_eq!(n.current(), &Page::Settings);
+        assert!(n.back(0.0));
+        assert_eq!(n.current(), &Page::Home);
+        assert!(!n.can_back());
+    }
+
+    #[test]
     fn opening_a_page_clears_forward() {
         let mut n = Nav::default();
         n.open(Page::Artists, 0.0);
@@ -263,26 +414,11 @@ mod tests {
 
     #[test]
     fn replace_keeps_history_length() {
-        let (_, _, kob, _) = lib();
+        let (_, _, kob, other) = lib();
         let mut n = Nav::default();
-        n.open(
-            Page::Album {
-                album: kob,
-                highlight: None,
-            },
-            0.0,
-        );
-        n.replace(Page::Album {
-            album: kob,
-            highlight: Some(TrackId(3)),
-        });
-        assert_eq!(
-            n.current(),
-            &Page::Album {
-                album: kob,
-                highlight: Some(TrackId(3))
-            }
-        );
+        n.open(Page::Album { album: kob }, 0.0);
+        n.replace(Page::Album { album: other });
+        assert_eq!(n.current(), &Page::Album { album: other });
         assert!(n.back(0.0));
         assert_eq!(n.current(), &Page::Home);
         assert!(!n.can_back());
@@ -311,10 +447,7 @@ mod tests {
     #[test]
     fn tab_follows_the_page_and_album_origin() {
         let (_, miles, kob, _) = lib();
-        let album = Page::Album {
-            album: kob,
-            highlight: None,
-        };
+        let album = Page::Album { album: kob };
         let mut n = Nav::default();
         assert_eq!(n.tab(), Some(Tab::Home));
         n.open(album.clone(), 0.0);
@@ -335,24 +468,21 @@ mod tests {
     }
 
     #[test]
+    fn both_playlist_pages_belong_to_the_playlists_tab() {
+        let mut n = Nav::default();
+        n.open(Page::Playlists, 0.0);
+        assert_eq!(n.tab(), Some(Tab::Playlists));
+        n.open(Page::Playlist("Mix".into()), 0.0);
+        assert_eq!(n.tab(), Some(Tab::Playlists));
+    }
+
+    #[test]
     fn validate_drops_vanished_entries_everywhere() {
         let (lib, miles, kob, other) = lib();
         let mut n = Nav::default();
         n.open(Page::Artist(miles), 0.0);
-        n.open(
-            Page::Album {
-                album: kob,
-                highlight: None,
-            },
-            0.0,
-        );
-        n.open(
-            Page::Album {
-                album: other,
-                highlight: None,
-            },
-            0.0,
-        );
+        n.open(Page::Album { album: kob }, 0.0);
+        n.open(Page::Album { album: other }, 0.0);
         n.back(0.0);
         // back [Home, Artist(miles)], current Album(kob), forward [Album(other)]
         assert!(n.can_forward());

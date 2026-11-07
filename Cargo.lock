@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "bp-cli"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "bp-core",
  "bp-decode",
@@ -549,13 +549,11 @@ dependencies = [
  "crossterm",
  "natord",
  "tempfile",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
 name = "bp-core"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -563,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "bp-decode"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "bp-core",
  "bp-decode",
@@ -574,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "bp-engine"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "bp-core",
  "bp-decode",
@@ -586,11 +584,12 @@ dependencies = [
  "tempfile",
  "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "bp-gui"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "bp-core",
  "bp-decode",
@@ -602,6 +601,7 @@ dependencies = [
  "egui_kittest",
  "id3",
  "image",
+ "libc",
  "lofty",
  "natord",
  "notify",
@@ -611,13 +611,14 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml",
+ "tracing",
  "windows",
  "winresource",
 ]
 
 [[package]]
 name = "bp-output"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "bp-core",
  "rtrb",

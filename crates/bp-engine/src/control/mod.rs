@@ -4,7 +4,7 @@
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -17,8 +17,9 @@ use tracing::{info, warn};
 use crate::analysis::AnalysisTap;
 use crate::decoder::{self, DecoderMsg, Job, StreamReply};
 use crate::profile::ProfileStore;
+use crate::queue::{Queue, Shared, lock};
 use crate::timeline::{Mark, Output, Segment, close_drained, report_progress, schedule};
-use crate::{Command, Event};
+use crate::{Command, Event, RearrangeRefusal};
 
 mod devices;
 
@@ -44,6 +45,9 @@ struct Playback {
     device: DeviceId,
     dec_rx: Option<Receiver<DecoderMsg>>,
     reply_tx: Option<Sender<StreamReply>>,
+    /// The queue, shared with the decoder: it takes its tracks from there, and `Next` and
+    /// `Seek` read it.
+    queue: Shared,
     cancel: Arc<AtomicBool>,
     decoder: Option<JoinHandle<()>>,
     stream: Option<Output>,
@@ -51,10 +55,11 @@ struct Playback {
     /// one has drained.
     pending: Option<(usize, Vec<PlaybackPath>)>,
     done: bool,
+    /// The first appended or inserted track the decoder never saw (it was done already):
+    /// playback continues from there on a new decoder once the stream has drained.
+    late: Option<usize>,
     /// Underruns of all streams of this playback.
     underruns: u64,
-    /// The queue, for `Next` and `Seek`.
-    tracks: Vec<PathBuf>,
     /// The track being played (the last `TrackStarted`), or the first one to play.
     index: usize,
     /// Where in track `index` the first stream starts; zero once it has drained.
@@ -157,6 +162,13 @@ impl Control {
                 self.stop();
                 self.start_playback(tracks, start, Duration::ZERO);
             }
+            Command::Append { tracks } => self.append(tracks),
+            Command::Insert { tracks } => self.insert(tracks),
+            Command::Rearrange {
+                from,
+                expected,
+                tracks,
+            } => self.rearrange(from, expected, tracks),
             Command::Stop => self.stop(),
             Command::Pause => self.pause(),
             Command::Resume => self.resume(),
@@ -165,6 +177,7 @@ impl Control {
             }
             Command::SelectDevice { id } => self.select_device(id),
             Command::Reprobe { id } => self.reprobe(&id),
+            Command::SetDop { id, enabled } => self.set_dop(&id, enabled),
             Command::RefreshDevices => self.relist_devices(),
             Command::Shutdown => unreachable!("handled by handle"),
         }
@@ -192,6 +205,66 @@ impl Control {
                 .and_then(Output::position)
                 .unwrap_or((play.index, play.start_pos)),
         )
+    }
+
+    /// Adds `tracks` to the queue; the decoder takes them after the ones it has. With
+    /// nothing playing they play like a new queue.
+    fn append(&mut self, tracks: Vec<PathBuf>) {
+        if tracks.is_empty() {
+            return;
+        }
+        let Some(play) = &mut self.play else {
+            return self.start_playback(tracks, 0, Duration::ZERO);
+        };
+        let mut queue = lock(&play.queue);
+        if play.done {
+            play.late.get_or_insert(queue.len());
+        }
+        // Once the decoder has finished, `Done` reports what it took.
+        queue.append(tracks);
+    }
+
+    /// Puts `tracks` after the decoder's track (see `Queue::insert`) and reports where. With
+    /// nothing playing they play like a new queue. A paused playback stays paused.
+    fn insert(&mut self, tracks: Vec<PathBuf>) {
+        if tracks.is_empty() {
+            return;
+        }
+        let Some(play) = &mut self.play else {
+            return self.start_playback(tracks, 0, Duration::ZERO);
+        };
+        let count = tracks.len();
+        let at = lock(&play.queue).insert(tracks);
+        if play.done {
+            // Nothing from `at` on reached the decoder: `at` is past every track it took.
+            play.late.get_or_insert(at);
+        }
+        self.emit(Event::Inserted { at, count });
+    }
+
+    /// Replaces the tracks from `from` on (see `Queue::rearrange`) and reports whether it did.
+    /// The check and the replace hold one queue lock, so the decoder cannot take a track in
+    /// between. A paused playback stays paused.
+    fn rearrange(&mut self, from: usize, expected: Vec<PathBuf>, tracks: Vec<PathBuf>) {
+        let result = match &mut self.play {
+            None => Err(RearrangeRefusal::Stopped),
+            Some(play) => {
+                let mut queue = lock(&play.queue);
+                let result = queue.rearrange(from, &expected, tracks);
+                if result.is_ok() && play.done {
+                    // Nothing from `from` on reached the decoder, so the first late track
+                    // is an earlier late point or else `from`. It counts only while a track
+                    // is still there (`late < len`): with every late track removed,
+                    // playback finishes after the drain.
+                    play.late = play.late.or(Some(from)).filter(|&late| late < queue.len());
+                }
+                result
+            }
+        };
+        self.emit(match result {
+            Ok(()) => Event::Rearranged { from },
+            Err(reason) => Event::RearrangeRefused { from, reason },
+        });
     }
 
     fn pause(&mut self) {
@@ -233,8 +306,8 @@ impl Control {
 
     /// Stops playback, returning its queue and pause state.
     fn stop_keeping_queue(&mut self) -> Option<(Vec<PathBuf>, bool)> {
-        let mut play = self.play.take()?;
-        let tracks = std::mem::take(&mut play.tracks);
+        let play = self.play.take()?;
+        let tracks = lock(&play.queue).tracks().to_vec();
         let paused = play.paused;
         stop_playback(play);
         Some((tracks, paused))
@@ -266,8 +339,9 @@ impl Control {
             Err(e) => return self.emit(Event::Error(e.into())),
         };
         info!(device = %device.0, tracks = tracks.len(), start, ?start_pos, "play");
+        let queue: Shared = Arc::new(Mutex::new(Queue::new(tracks, start)));
         let job = Job {
-            tracks: tracks.clone(),
+            queue: Arc::clone(&queue),
             start,
             start_pos,
             caps: profile.capabilities(),
@@ -284,8 +358,7 @@ impl Control {
                 .spawn(move || decoder::run(job, ctl_tx, reply_rx, cancel))
                 .expect("spawn decoder thread")
         };
-        let mut play = Playback::new(device, dec_rx, reply_tx, cancel, decoder);
-        play.tracks = tracks;
+        let mut play = Playback::new(device, dec_rx, reply_tx, queue, cancel, decoder);
         play.index = start;
         play.start_pos = start_pos;
         self.play = Some(play);
@@ -354,7 +427,12 @@ impl Control {
                     }
                 }
             }
-            DecoderMsg::Done => play.done = true,
+            DecoderMsg::Done { tracks } => {
+                play.done = true;
+                if tracks < lock(&play.queue).len() {
+                    play.late = Some(tracks);
+                }
+            }
         }
     }
 
@@ -421,6 +499,13 @@ impl Control {
         } else if play.done {
             if let Some(out) = play.stream.take() {
                 close_drained(out, &self.events);
+            }
+            if let Some(late) = play.late {
+                // Appended after the decoder finished: a new one plays them, after a gap.
+                if let Some((tracks, paused)) = self.stop_keeping_queue() {
+                    self.play_from(tracks, late, Duration::ZERO, paused);
+                }
+                return;
             }
             self.stop();
             info!("queue finished");
@@ -491,6 +576,7 @@ impl Playback {
         device: DeviceId,
         dec_rx: Receiver<DecoderMsg>,
         reply_tx: Sender<StreamReply>,
+        queue: Shared,
         cancel: Arc<AtomicBool>,
         decoder: JoinHandle<()>,
     ) -> Playback {
@@ -498,13 +584,14 @@ impl Playback {
             device,
             dec_rx: Some(dec_rx),
             reply_tx: Some(reply_tx),
+            queue,
             cancel,
             decoder: Some(decoder),
             stream: None,
             pending: None,
             done: false,
+            late: None,
             underruns: 0,
-            tracks: Vec::new(),
             index: 0,
             start_pos: Duration::ZERO,
             paused: false,
@@ -603,26 +690,24 @@ mod tests {
 
     use super::*;
 
-    /// A control with a started stream whose timeline holds two tracks, both already
-    /// reached by `frames_played` (0) but not yet reported, as right after a gapless
-    /// boundary between two ticks.
-    fn boundary_not_yet_reported() -> (Control, Receiver<Event>) {
-        let encoding = SampleEncoding::Int {
+    const FMT: DeviceFormat = DeviceFormat {
+        sample_rate: 44_100,
+        channels: 2,
+        encoding: SampleEncoding::Int {
             container: 16,
             valid: 16,
-        };
-        let fmt = DeviceFormat {
-            sample_rate: 44_100,
-            channels: 2,
-            encoding,
-        };
+        },
+    };
+
+    /// A control on a capture backend that plays 16-bit 44.1 kHz, with nothing playing.
+    fn capture_control() -> (Control, Receiver<Event>) {
         let mut caps = Capabilities::default();
-        caps.formats.insert((44_100, 2, encoding));
+        caps.formats.insert((FMT.sample_rate, 2, FMT.encoding));
         let (backend, _log) = CaptureBackend::new(caps);
         let dir = tempfile::tempdir().unwrap();
         let profiles = ProfileStore::load(&dir.path().join("devices.toml")).unwrap();
         let (evt_tx, evt_rx) = unbounded();
-        let mut control = Control::new(
+        let control = Control::new(
             Box::new(backend),
             profiles,
             None,
@@ -630,6 +715,43 @@ mod tests {
             Arc::default(),
             AnalysisTap::default(),
         );
+        (control, evt_rx)
+    }
+
+    /// A control playing `tracks` with no stream open yet and the decoder on track 0 (a
+    /// stand-in that does nothing).
+    fn decoding_first(tracks: Vec<PathBuf>) -> (Control, Receiver<Event>) {
+        let (mut control, evt_rx) = capture_control();
+        let (_ctl_tx, dec_rx) = unbounded();
+        let (reply_tx, _reply_rx) = bounded(1);
+        let decoder = thread::spawn(|| {});
+        let cancel = Arc::new(AtomicBool::new(false));
+        let queue = shared(tracks, 0);
+        lock(&queue).take(0);
+        let device = DeviceId("capture".into());
+        let play = Playback::new(device, dec_rx, reply_tx, queue, cancel, decoder);
+        control.play = Some(play);
+        (control, evt_rx)
+    }
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../bp-decode/tests/fixtures/"
+        ))
+        .join(name)
+    }
+
+    fn paths(list: &[&str]) -> Vec<PathBuf> {
+        list.iter().map(PathBuf::from).collect()
+    }
+
+    /// A control with a started stream whose timeline holds two tracks, both already
+    /// reached by `frames_played` (0) but not yet reported, as right after a gapless
+    /// boundary between two ticks.
+    fn boundary_not_yet_reported() -> (Control, Receiver<Event>) {
+        let fmt = FMT;
+        let (mut control, evt_rx) = capture_control();
         let device = DeviceId("capture".into());
         let (_producer, consumer) = RingBuffer::new(4_000);
         let feed = Feed {
@@ -642,8 +764,9 @@ mod tests {
         let (reply_tx, _reply_rx) = bounded(1);
         let decoder = thread::spawn(|| {});
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut play = Playback::new(device, dec_rx, reply_tx, cancel, decoder);
-        play.tracks = vec![PathBuf::from("t0"), PathBuf::from("t1")];
+        let tracks = vec![PathBuf::from("t0"), PathBuf::from("t1")];
+        let queue = shared(tracks.clone(), 0);
+        let mut play = Playback::new(device, dec_rx, reply_tx, queue, cancel, decoder);
         let playback = PlaybackPath {
             source: SourceFormat {
                 codec: Codec::Wav,
@@ -659,10 +782,10 @@ mod tests {
         };
         let mut out = Output::new(stream);
         out.started = true;
-        for index in 0..2 {
+        for (index, path) in tracks.iter().enumerate() {
             let seg = Segment {
                 index,
-                path: play.tracks[index].clone(),
+                path: path.clone(),
                 playback,
                 duration: None,
                 start_pos: Duration::ZERO,
@@ -672,6 +795,10 @@ mod tests {
         play.stream = Some(out);
         control.play = Some(play);
         (control, evt_rx)
+    }
+
+    fn shared(tracks: Vec<PathBuf>, start: usize) -> Shared {
+        Arc::new(Mutex::new(Queue::new(tracks, start)))
     }
 
     /// The events emitted so far, except `Position` and `DevicesChanged`.
@@ -720,6 +847,330 @@ mod tests {
             "{events:?}"
         );
         assert!(control.play.is_none());
+    }
+
+    #[test]
+    fn append_after_decoder_done_starts_after_drain() {
+        let (mut control, _rx) = boundary_not_yet_reported();
+        // The decoder finished after track 0: track 1 was appended too late for it.
+        control.decoder_msg(DecoderMsg::Done { tracks: 1 });
+        control.update();
+        assert!(
+            control.play.as_ref().is_some_and(|p| p.done),
+            "not drained yet"
+        );
+        control.decoder_msg(DecoderMsg::StreamEnd { end_frame: 0 });
+        control.update();
+        let play = control.play.as_ref().expect("a new playback");
+        assert!(!play.done && play.late.is_none(), "a fresh decoder job");
+        assert_eq!((play.index, lock(&play.queue).len()), (1, 2));
+        control.stop();
+    }
+
+    #[test]
+    fn insert_reports_where_the_tracks_went() {
+        let (mut control, rx) = decoding_first(paths(&["a", "b"]));
+        control.command(Command::Insert {
+            tracks: paths(&["x"]),
+        });
+        let events = drain(&rx);
+        assert!(
+            matches!(events[..], [Event::Inserted { at: 1, count: 1 }]),
+            "{events:?}"
+        );
+        let play = control.play.as_ref().unwrap();
+        assert_eq!(lock(&play.queue).tracks(), paths(&["a", "x", "b"]));
+        control.stop();
+    }
+
+    #[test]
+    fn insert_while_stopped_plays_the_tracks() {
+        let (mut control, rx) = capture_control();
+        control.command(Command::Insert {
+            tracks: paths(&["x", "y"]),
+        });
+        let play = control.play.as_ref().expect("playback started");
+        assert_eq!(play.index, 0);
+        assert_eq!(lock(&play.queue).tracks(), paths(&["x", "y"]));
+        let events = drain(&rx);
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Inserted { .. })),
+            "{events:?}"
+        );
+        control.stop();
+    }
+
+    #[test]
+    fn insert_after_decoder_done_starts_after_drain() {
+        let (mut control, rx) = boundary_not_yet_reported();
+        // The decoder finished after the only track; the insert comes too late for it.
+        let queue = shared(paths(&["t0"]), 0);
+        lock(&queue).take(0);
+        lock(&queue).take(1);
+        control.play.as_mut().unwrap().queue = queue;
+        control.decoder_msg(DecoderMsg::Done { tracks: 1 });
+        control.command(Command::Insert {
+            tracks: paths(&["x"]),
+        });
+        let play = control.play.as_ref().unwrap();
+        assert_eq!(play.late, Some(1));
+        let events = drain(&rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Inserted { at: 1, count: 1 })),
+            "{events:?}"
+        );
+        control.update();
+        assert!(
+            control.play.as_ref().is_some_and(|p| p.done),
+            "not drained yet"
+        );
+        control.decoder_msg(DecoderMsg::StreamEnd { end_frame: 0 });
+        control.update();
+        let play = control.play.as_ref().expect("a new playback");
+        assert!(!play.done && play.late.is_none(), "a fresh decoder job");
+        assert_eq!((play.index, lock(&play.queue).len()), (1, 2));
+        control.stop();
+    }
+
+    #[test]
+    fn rearrange_applies_before_the_decoder_takes_the_next_track() {
+        let (mut control, rx) = decoding_first(paths(&["a", "b", "c"]));
+        control.command(Command::Rearrange {
+            from: 1,
+            expected: paths(&["b", "c"]),
+            tracks: paths(&["c"]),
+        });
+        let events = drain(&rx);
+        assert!(
+            matches!(events[..], [Event::Rearranged { from: 1 }]),
+            "{events:?}"
+        );
+        let play = control.play.as_ref().unwrap();
+        assert_eq!(lock(&play.queue).tracks(), paths(&["a", "c"]));
+        control.stop();
+    }
+
+    #[test]
+    fn rearrange_is_refused_once_the_decoder_took_the_track() {
+        let (mut control, rx) = decoding_first(paths(&["a", "b", "c"]));
+        lock(&control.play.as_ref().unwrap().queue).take(1);
+        control.command(Command::Rearrange {
+            from: 1,
+            expected: paths(&["b", "c"]),
+            tracks: paths(&["c"]),
+        });
+        let events = drain(&rx);
+        assert!(
+            matches!(
+                events[..],
+                [Event::RearrangeRefused {
+                    from: 1,
+                    reason: RearrangeRefusal::Started
+                }]
+            ),
+            "{events:?}"
+        );
+        let play = control.play.as_ref().unwrap();
+        assert_eq!(lock(&play.queue).tracks(), paths(&["a", "b", "c"]));
+        control.stop();
+    }
+
+    #[test]
+    fn rearrange_with_nothing_playing_is_refused_stopped() {
+        let (mut control, rx) = capture_control();
+        control.command(Command::Rearrange {
+            from: 1,
+            expected: paths(&["b"]),
+            tracks: vec![],
+        });
+        let events = drain(&rx);
+        assert!(
+            matches!(
+                events[..],
+                [Event::RearrangeRefused {
+                    from: 1,
+                    reason: RearrangeRefusal::Stopped
+                }]
+            ),
+            "{events:?}"
+        );
+        assert!(control.play.is_none());
+    }
+
+    #[test]
+    fn rearrange_answers_in_command_order_between_inserts() {
+        let (mut control, rx) = decoding_first(paths(&["a", "b", "c"]));
+        control.command(Command::Insert {
+            tracks: paths(&["x"]),
+        });
+        control.command(Command::Rearrange {
+            from: 1,
+            expected: paths(&["x", "b", "c"]),
+            tracks: paths(&["c"]),
+        });
+        control.command(Command::Insert {
+            tracks: paths(&["y"]),
+        });
+        control.command(Command::Rearrange {
+            from: 9,
+            expected: vec![],
+            tracks: paths(&["z"]),
+        });
+        let events = drain(&rx);
+        assert!(
+            matches!(
+                events[..],
+                [
+                    Event::Inserted { at: 1, count: 1 },
+                    Event::Rearranged { from: 1 },
+                    Event::Inserted { at: 1, count: 1 },
+                    Event::RearrangeRefused {
+                        from: 9,
+                        reason: RearrangeRefusal::Changed
+                    }
+                ]
+            ),
+            "{events:?}"
+        );
+        let play = control.play.as_ref().unwrap();
+        assert_eq!(lock(&play.queue).tracks(), paths(&["a", "y", "c"]));
+        control.stop();
+    }
+
+    /// A control whose decoder finished after the only track `t0`, with `t1` and `t2`
+    /// appended too late for it; its stream has not drained yet.
+    fn late_tracks_appended() -> (Control, Receiver<Event>) {
+        let (mut control, rx) = boundary_not_yet_reported();
+        let queue = shared(paths(&["t0"]), 0);
+        lock(&queue).take(0);
+        lock(&queue).take(1);
+        control.play.as_mut().unwrap().queue = queue;
+        control.decoder_msg(DecoderMsg::Done { tracks: 1 });
+        control.command(Command::Append {
+            tracks: paths(&["t1", "t2"]),
+        });
+        assert_eq!(control.play.as_ref().unwrap().late, Some(1));
+        (control, rx)
+    }
+
+    #[test]
+    fn rearranged_late_tracks_play_after_the_drain() {
+        let (mut control, rx) = late_tracks_appended();
+        control.command(Command::Rearrange {
+            from: 1,
+            expected: paths(&["t1", "t2"]),
+            tracks: paths(&["t2"]),
+        });
+        let events = drain(&rx);
+        assert!(
+            matches!(events[..], [Event::Rearranged { from: 1 }]),
+            "{events:?}"
+        );
+        control.update();
+        assert!(
+            control.play.as_ref().is_some_and(|p| p.done),
+            "not drained yet"
+        );
+        control.decoder_msg(DecoderMsg::StreamEnd { end_frame: 0 });
+        control.update();
+        let play = control.play.as_ref().expect("a new playback");
+        assert!(!play.done && play.late.is_none(), "a fresh decoder job");
+        assert_eq!(play.index, 1);
+        assert_eq!(lock(&play.queue).tracks(), paths(&["t0", "t2"]));
+        control.stop();
+    }
+
+    #[test]
+    fn removing_every_late_track_finishes_the_queue() {
+        let (mut control, rx) = late_tracks_appended();
+        control.command(Command::Rearrange {
+            from: 1,
+            expected: paths(&["t1", "t2"]),
+            tracks: vec![],
+        });
+        assert_eq!(control.play.as_ref().unwrap().late, None);
+        control.update();
+        assert!(
+            control.play.as_ref().is_some_and(|p| p.done),
+            "not drained yet"
+        );
+        control.decoder_msg(DecoderMsg::StreamEnd { end_frame: 0 });
+        control.update();
+        assert!(control.play.is_none());
+        let events = drain(&rx);
+        assert!(
+            matches!(
+                events[..],
+                [Event::Rearranged { from: 1 }, .., Event::QueueFinished]
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn late_tracks_put_back_after_removing_them_play_after_the_drain() {
+        let (mut control, rx) = late_tracks_appended();
+        control.command(Command::Rearrange {
+            from: 1,
+            expected: paths(&["t1", "t2"]),
+            tracks: vec![],
+        });
+        // An undo puts them back: the decoder never saw them, so they are late again.
+        control.command(Command::Rearrange {
+            from: 1,
+            expected: vec![],
+            tracks: paths(&["t1", "t2"]),
+        });
+        let events = drain(&rx);
+        assert!(
+            matches!(
+                events[..],
+                [Event::Rearranged { from: 1 }, Event::Rearranged { from: 1 }]
+            ),
+            "{events:?}"
+        );
+        assert_eq!(control.play.as_ref().unwrap().late, Some(1));
+        control.decoder_msg(DecoderMsg::StreamEnd { end_frame: 0 });
+        control.update();
+        let play = control.play.as_ref().expect("a new playback");
+        assert_eq!(play.index, 1);
+        assert_eq!(lock(&play.queue).tracks(), paths(&["t0", "t1", "t2"]));
+        control.stop();
+    }
+
+    #[test]
+    fn insert_after_a_seek_goes_after_the_current_track() {
+        // A real first track: after the seek the new decoder opens it and waits for a
+        // stream there, so it stays on track 0.
+        let a = fixture("wav_16_44_a.wav");
+        let (mut control, rx) = decoding_first(vec![a.clone(), "b".into(), "c".into()]);
+        control.command(Command::Insert {
+            tracks: paths(&["x"]),
+        });
+        control.command(Command::Seek {
+            position: Duration::ZERO,
+        });
+        // The seek restarted the decoder: the insert point of the first insert is gone.
+        control.command(Command::Insert {
+            tracks: paths(&["y"]),
+        });
+        let events = drain(&rx);
+        assert!(
+            matches!(
+                events[..],
+                [
+                    Event::Inserted { at: 1, count: 1 },
+                    Event::Inserted { at: 1, count: 1 }
+                ]
+            ),
+            "{events:?}"
+        );
+        let play = control.play.as_ref().unwrap();
+        let want = vec![a, "y".into(), "x".into(), "b".into(), "c".into()];
+        assert_eq!(lock(&play.queue).tracks(), want);
+        control.stop();
     }
 
     #[test]
@@ -857,7 +1308,14 @@ mod tests {
             panic!("boom");
         });
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut play = Playback::new(device, dec_rx, reply_tx, cancel, decoder);
+        let mut play = Playback::new(
+            device,
+            dec_rx,
+            reply_tx,
+            shared(Vec::new(), 0),
+            cancel,
+            decoder,
+        );
         play.stream = Some(Output::new(stream));
         control.play = Some(play);
 

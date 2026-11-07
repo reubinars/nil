@@ -1,14 +1,16 @@
 //! The search page: matching artists, albums and tracks, each section shown when it has
 //! hits.
 
-use egui::{Align2, CornerRadius, FontId, Key, Pos2, Response, Role, Sense, Ui, WidgetInfo, vec2};
+use egui::{Align2, CornerRadius, FontId, Pos2, Response, Role, Sense, Ui, WidgetInfo, vec2};
 
 use crate::art::ArtLoader;
-use crate::backend::{AlbumId, ArtistId, Track, TrackId};
+use crate::backend::{AlbumId, ArtistId, Track};
 use crate::fmt::{duration, short_format};
 use crate::state::search::SearchResults;
-use crate::theme::{HOVER, TEXT, TEXT_2, TEXT_3, semibold};
-use crate::views::albums::{GAP, layout, tile_widget};
+use crate::state::selection::{ListId, Selection};
+use crate::theme::{HOVER, SELECTED, TEXT, TEXT_2, TEXT_3, semibold};
+use crate::views::albums::{GAP, TileAction, TileMenu, layout, tile_widget};
+use crate::views::context_menu::{self, MenuAction, MenuPlace, MenuSpec, RowAction};
 use crate::views::{artists, heading, truncated};
 
 const ROW_HEIGHT: f32 = 48.0;
@@ -18,11 +20,25 @@ const DURATION_W: f32 = 60.0;
 pub enum SearchAction {
     Artist(ArtistId),
     Album(AlbumId),
-    OpenTrack { album: AlbumId, track: TrackId },
-    PlayTrack { album: AlbumId, track: TrackId },
+    /// An album tile's menu was used.
+    AlbumMenu(AlbumId, MenuAction),
+    /// A track row was clicked, activated or its menu used; rows index `tracks`.
+    Row(RowAction),
 }
 
-pub fn show(ui: &mut Ui, r: &SearchResults, art: &mut ArtLoader) -> Option<SearchAction> {
+/// What the track rows' selection and menu need.
+pub struct TrackRows<'a> {
+    pub selection: &'a Selection,
+    pub playlists: &'a [String],
+    pub device_ready: bool,
+}
+
+pub fn show(
+    ui: &mut Ui,
+    r: &SearchResults,
+    art: &mut ArtLoader,
+    rows: &TrackRows,
+) -> Option<SearchAction> {
     let mut action = None;
     if r.is_empty() {
         ui.vertical_centered(|ui| {
@@ -53,8 +69,18 @@ pub fn show(ui: &mut Ui, r: &SearchResults, art: &mut ArtLoader) -> Option<Searc
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = GAP;
                         for album in row {
-                            if tile_widget(ui, album, art, side) {
-                                action = Some(SearchAction::Album(album.id));
+                            let menu = TileMenu {
+                                playlists: rows.playlists,
+                                device_ready: rows.device_ready,
+                            };
+                            match tile_widget(ui, album, art, side, menu) {
+                                Some(TileAction::Open(id)) => {
+                                    action = Some(SearchAction::Album(id))
+                                }
+                                Some(TileAction::Menu(id, a)) => {
+                                    action = Some(SearchAction::AlbumMenu(id, a));
+                                }
+                                None => {}
                             }
                         }
                     });
@@ -64,19 +90,22 @@ pub fn show(ui: &mut Ui, r: &SearchResults, art: &mut ArtLoader) -> Option<Searc
             if !r.tracks.is_empty() {
                 section(ui, "Tracks");
                 ui.spacing_mut().item_spacing.y = 0.0;
-                for (t, album) in &r.tracks {
-                    let resp = track_row(ui, t, &album.artist, &album.title);
-                    let enter = resp.has_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    if resp.double_clicked() || enter {
-                        action = Some(SearchAction::PlayTrack {
-                            album: album.id,
-                            track: t.id,
-                        });
-                    } else if resp.clicked() {
-                        action = Some(SearchAction::OpenTrack {
-                            album: album.id,
-                            track: t.id,
-                        });
+                let list = ListId::SearchTracks(r.query.clone());
+                let shown: Vec<usize> = (0..r.tracks.len()).collect();
+                for (i, (t, album)) in r.tracks.iter().enumerate() {
+                    let selected = rows.selection.is_selected(&list, i);
+                    let resp = track_row(ui, t, &album.artist, &album.title, selected);
+                    let spec = MenuSpec {
+                        place: MenuPlace::Track { search: true },
+                        count: 0,
+                        playlists: rows.playlists,
+                        exclude: None,
+                        device_ready: rows.device_ready,
+                    };
+                    if let Some(a) =
+                        context_menu::row(&resp, &list, &shown, i, rows.selection, spec)
+                    {
+                        action = Some(SearchAction::Row(a));
                     }
                 }
             }
@@ -98,14 +127,17 @@ fn section(ui: &mut Ui, title: &str) {
 }
 
 /// Title over "artist · album", then format and length.
-fn track_row(ui: &mut Ui, t: &Track, artist: &str, album: &str) -> Response {
+fn track_row(ui: &mut Ui, t: &Track, artist: &str, album: &str, selected: bool) -> Response {
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
     resp.widget_info(|| WidgetInfo::labeled(Role::ListItem, true, &t.title));
     if !ui.is_rect_visible(rect) {
         return resp;
     }
-    if resp.hovered() {
+    if selected {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(4), SELECTED);
+    } else if resp.hovered() {
         ui.painter().rect_filled(rect, CornerRadius::same(4), HOVER);
     }
     let dur_right = rect.right() - 12.0;

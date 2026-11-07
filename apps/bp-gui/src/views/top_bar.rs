@@ -1,5 +1,5 @@
 //! The top bar, which is also the window's title bar: the nil wordmark, back/forward, the Home / Albums /
-//! Artists tabs, search, the settings gear and the window buttons. Its empty space moves
+//! Artists / Playlists tabs, search, the settings gear and the window buttons. Its empty space moves
 //! the window.
 
 use egui::{
@@ -18,6 +18,8 @@ const WORDMARK_HEIGHT: f32 = 26.0;
 
 pub struct TopBarData {
     pub tab: Option<Tab>,
+    /// One tab per plugin panel, after Playlists: (plugin folder name, label).
+    pub plugins: Vec<(String, String)>,
     pub can_back: bool,
     pub can_forward: bool,
     pub settings_open: bool,
@@ -56,8 +58,15 @@ pub fn show(ui: &mut Ui, data: &TopBarData, query: &mut String) -> Option<TopBar
             (Tab::Home, "Home"),
             (Tab::Albums, "Albums"),
             (Tab::Artists, "Artists"),
+            (Tab::Playlists, "Playlists"),
         ] {
-            if tab_button(ui, label, data.tab == Some(tab)).clicked() {
+            if tab_button(ui, label, data.tab.as_ref() == Some(&tab)).clicked() {
+                action = Some(TopBarAction::Tab(tab));
+            }
+        }
+        for (id, label) in &data.plugins {
+            let tab = Tab::Plugin(id.clone());
+            if tab_button(ui, label, data.tab.as_ref() == Some(&tab)).clicked() {
                 action = Some(TopBarAction::Tab(tab));
             }
         }

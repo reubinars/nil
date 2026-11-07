@@ -10,8 +10,8 @@ use crate::theme::{BORDER, HOVER, RAISED, TEXT, TEXT_2, TEXT_3, semibold};
 use crate::views::truncated;
 
 /// Inner width; the popup frame adds its margin.
-const WIDTH: f32 = 268.0;
-const ROW_HEIGHT: f32 = 40.0;
+pub(crate) const WIDTH: f32 = 268.0;
+pub(crate) const ROW_HEIGHT: f32 = 40.0;
 
 pub enum DeviceListAction {
     Select(DeviceId),

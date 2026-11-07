@@ -1,12 +1,18 @@
 pub mod app;
 pub mod art;
 pub mod backend;
+pub mod catalog;
 pub mod fmt;
 pub mod icon;
 #[cfg(windows)]
 pub mod instance;
+pub mod migrate;
 pub mod paths;
+pub mod playlists;
+pub mod plugin_bridge;
+pub mod plugins;
 pub mod prefs;
+pub mod queue_edit;
 pub mod state;
 pub mod theme;
 pub mod views;

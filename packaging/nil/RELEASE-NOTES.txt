@@ -1,6 +1,73 @@
 nil release notes
 =================
 
+Unreleased
+----------
+
+Audio
+- Settings > Audio has a DSD over PCM (DoP) switch for the selected DAC.
+  Turning it on asks first, since a DAC that doesn't decode DoP plays it as
+  hiss. It applies from the next track you start. Before this, DoP could only
+  be turned on with the bp command-line tool, so a DAC that Windows listed as
+  a new device (after a driver change or in another USB port) skipped every
+  DSD track.
+
+0.3.0
+-----
+
+Queue
+- The upcoming tracks in Now Playing (the ones after the current track) can
+  be edited while playing or paused. Right-click one for Remove from queue
+  or Play next, select tracks and press Delete to remove them, or drag them
+  to a new place in the queue.
+- A Clear upcoming button removes every track after the current one.
+- Undo (the button by the notice, or Ctrl+Z) puts the last edit back, keeping
+  any tracks added to the queue since.
+- In the last seconds of a track, the next one has already started loading:
+  an edit that touches it says "Already starting" and leaves it in place.
+  Clear upcoming then clears the tracks after it.
+
+Plugins
+- Three new plugin methods edit the queue: player.remove, player.move and
+  player.clear_upcoming. The DJ plugin uses them to remove, move and clear
+  upcoming tracks.
+
+0.2.0
+-----
+
+Data
+- nil keeps everything next to nil.exe, in a data folder, so the whole nil
+  folder can be copied or moved. Your existing settings, library index and
+  thumbnails are moved there automatically on the first start; nothing needs
+  doing, and the old folders are removed once the copy is complete.
+- After upgrading, don't go back to an older nil: the old data folder is
+  cleaned up, so an older version would start without your settings.
+- If the folder holding nil.exe isn't writable, nil uses %APPDATA%\nil and
+  Settings says so. Settings also shows the data folder, with an Open folder
+  button.
+- nil now writes a log to data\logs\bp.log.
+
+Playlists
+- A Playlists tab with your saved playlists: play, queue, rename or delete.
+- "Save queue as playlist" in Now Playing. Playlists are standard .m3u8
+  files; files from other players (with or without a BOM, relative paths,
+  plain lists) open too, and tracks that have gone missing are greyed out and
+  skipped.
+- Tracks can be added to the end of the queue, and playback stays gapless
+  across the join when the formats match.
+
+Plugins
+- Plugins are separate programs that add features to nil. Put one in the
+  plugins folder and switch it on in Settings > Plugins. Each plugin lists
+  the permissions it asks for (playback, library, playlists), and a new
+  plugin is off until you approve them.
+- A plugin can add its own tab to the top bar, with text, buttons, inputs and
+  track lists drawn in nil's own style.
+- A plugin that crashes is restarted a couple of times, then marked Crashed
+  with the last lines it printed and a Restart button.
+- The plugin API is documented in PLUGIN-API.md (online, in nil's
+  repository), with a small example plugin.
+
 0.1.1
 -----
 

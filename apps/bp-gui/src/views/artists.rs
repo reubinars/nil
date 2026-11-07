@@ -27,9 +27,9 @@ pub fn show(
         tiles.len(),
         CAPTION,
         restore,
-        |ui, i, side| tile_widget(ui, &tiles[i], art, side),
+        |ui, i, side| tile_widget(ui, &tiles[i], art, side).then_some(tiles[i].id),
     );
-    (clicked.map(|i| tiles[i].id), scroll)
+    (clicked, scroll)
 }
 
 /// One row of tiles that scrolls sideways, for the search page.

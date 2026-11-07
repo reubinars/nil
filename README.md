@@ -7,7 +7,8 @@ Nothing added.
 - **Bit-perfect output** through WASAPI exclusive mode, event-driven, with a badge that says
   whether what reaches the DAC is bit-perfect.
 - **Formats:** FLAC (MQA passes through untouched), WAV, AIFF, ALAC, DSF and DFF (DSD as DoP),
-  and AAC-LC (lossy; decoded to 24-bit, gapless, marked not bit-perfect).
+  and AAC-LC (lossy; decoded to 24-bit, gapless, marked not bit-perfect). DoP is switched on
+  per DAC in Settings, after a warning, since a DAC without DoP plays it as hiss.
 - **Strict by design:** a track the DAC can't play as it is gets skipped with the reason,
   never silently converted.
 - **Library:** parallel scan, instant start from a saved index, albums grouped across
@@ -15,6 +16,12 @@ Nothing added.
 - **Interface:** Home with recently added albums, Albums, Artists, search, album pages, a
   floating now-playing bar with a live spectrum, a full-window Now Playing view, and a
   capability table for your DAC.
+- **Queue and playlists:** edit the upcoming tracks while playing (remove, play next, drag,
+  clear, undo), and save or open playlists as standard `.m3u8` files.
+- **Plugins:** separate programs that add features, each with the permissions you approve and
+  optionally its own tab. See [PLUGIN-API.md](PLUGIN-API.md) and the example in
+  `examples/plugins/hello`.
+- **Portable:** settings, the library index and logs live in a `data` folder next to `nil.exe`.
 
 ## Download
 
@@ -50,6 +57,8 @@ Run the tests with `cargo test --workspace`.
 | `apps/bp-gui` | nil itself (egui) |
 | `apps/bp-cli` | `bp`, a command-line player and checker used during development |
 | `packaging/nil` | The README and release notes shipped with nil |
+| `examples/plugins` | An example plugin (Python) |
+| `PLUGIN-API.md` | The plugin API |
 
 ## Licence
 

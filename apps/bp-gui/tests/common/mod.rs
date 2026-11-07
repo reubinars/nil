@@ -22,7 +22,7 @@ use bp_gui::prefs::Prefs;
 use bp_output::{CaptureBackend, CaptureLog};
 use egui::{Modifiers, PointerButton, Role};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use tempfile::TempDir;
 
 pub const CD: SourceFormat = SourceFormat {
@@ -114,6 +114,18 @@ impl Fixture {
         self.dir.path().join("gui.toml")
     }
 
+    /// What the fake plugin received so far, one line per message.
+    pub fn plugin_log(&self) -> String {
+        std::fs::read_to_string(
+            self.dir
+                .path()
+                .join("plugins")
+                .join(PLUGIN)
+                .join("fake-plugin.log"),
+        )
+        .unwrap_or_default()
+    }
+
     pub fn last_sent(&self) -> Option<PlayerCommand> {
         self.player.sent().pop()
     }
@@ -151,6 +163,67 @@ impl Fixture {
                 });
             }
         }
+        self.harness.run();
+    }
+
+    /// Right-clicks the track row titled `title`.
+    pub fn right_click_track(&mut self, title: &str) {
+        self.harness
+            .get_by_role_and_label(Role::ListItem, title)
+            .click_secondary();
+        self.harness.run();
+    }
+
+    /// Right-clicks the album tile titled `title`.
+    pub fn right_click_tile(&mut self, title: &str) {
+        self.harness
+            .get_by_role_and_label(Role::Button, title)
+            .click_secondary();
+        self.harness.run();
+    }
+
+    /// Clicks the track row titled `title` with `modifiers` held.
+    pub fn click_track_with(&mut self, title: &str, modifiers: Modifiers) {
+        self.harness
+            .get_by_role_and_label(Role::ListItem, title)
+            .click_modifiers(modifiers);
+        self.harness.run();
+    }
+
+    /// The labels of the open menu's items, in order (the innermost menu when a
+    /// submenu is open).
+    pub fn menu_labels(&self) -> Vec<String> {
+        let menu = self
+            .harness
+            .get_all_by_role(Role::Menu)
+            .last()
+            .expect("a menu is open");
+        menu.get_all_by_role(Role::Button)
+            .filter_map(|n| n.accesskit_node().label())
+            .collect()
+    }
+
+    /// Whether the open menu's item `label` can be chosen.
+    pub fn menu_item_enabled(&self, label: &str) -> bool {
+        let menu = self
+            .harness
+            .get_all_by_role(Role::Menu)
+            .last()
+            .expect("a menu is open");
+        !menu
+            .get_by_role_and_label(Role::Button, label)
+            .accesskit_node()
+            .is_disabled()
+    }
+
+    /// Clicks item `label` in the open menu (the innermost one).
+    pub fn menu_item(&mut self, label: &str) {
+        self.harness
+            .get_all_by_role(Role::Menu)
+            .last()
+            .expect("a menu is open")
+            .get_by_role_and_label(Role::Button, label)
+            .click();
         self.harness.run();
     }
 
@@ -220,7 +293,96 @@ pub fn build(
     size: egui::Vec2,
     tofu: bool,
 ) -> Fixture {
+    build_with_plugin(tracks, devices, folders, picked, prefs, size, tofu, None)
+}
+
+/// The home every test window reports: a fixed path, so Settings snapshots do not
+/// show a random temp folder. Nothing is created there.
+pub fn test_home() -> bp_engine::home::Home {
+    bp_engine::home::Home {
+        root: PathBuf::from("/nil"),
+        fallback_reason: None,
+        data_override: None,
+    }
+}
+
+/// The plugin `fixture_with_plugin` installs.
+pub const PLUGIN: &str = "p";
+
+/// Installs the fake plugin as `PLUGIN` under `<dir>/plugins`, enabled with every
+/// permission granted, running `args`.
+fn install_plugin(dir: &std::path::Path, args: &[&str]) {
+    use bp_gui::plugins::consent::{Consent, ConsentStore};
+    use bp_gui::plugins::rpc::Permission;
+
+    let folder = dir.join("plugins").join(PLUGIN);
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut command = vec![env!("CARGO_BIN_EXE_fake-plugin").to_string()];
+    command.extend(args.iter().map(|a| a.to_string()));
+    let perms = [
+        Permission::Playback,
+        Permission::Library,
+        Permission::Playlists,
+    ];
+    let names: Vec<&str> = perms.iter().map(|p| p.name()).collect();
+    std::fs::write(
+        folder.join("plugin.toml"),
+        format!(
+            "name = {PLUGIN:?}\nversion = \"0\"\ndescription = \"\"\napi_version = 1\n\
+             command = {command:?}\npermissions = {names:?}\n"
+        ),
+    )
+    .unwrap();
+    ConsentStore::load(&dir.join("data").join("plugins.toml"))
+        .set(
+            PLUGIN,
+            Consent {
+                enabled: true,
+                granted: perms.to_vec(),
+            },
+        )
+        .unwrap();
+}
+
+/// A library window with the fake plugin running `args` (see `fake-plugin`), started
+/// with the window's repaint as its waker.
+pub fn fixture_with_plugin(args: &[&str]) -> Fixture {
+    fixture_with_plugin_sized(args, egui::vec2(1280.0, 800.0))
+}
+
+/// [`fixture_with_plugin`] in a window of `size`.
+pub fn fixture_with_plugin_sized(args: &[&str], size: egui::Vec2) -> Fixture {
+    build_with_plugin(
+        tracks(),
+        demo_devices(),
+        vec![PathBuf::from("/music")],
+        None,
+        None,
+        size,
+        false,
+        Some(args),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_with_plugin(
+    tracks: Vec<ScannedTrack>,
+    devices: Vec<MockDevice>,
+    folders: Vec<PathBuf>,
+    picked: Option<PathBuf>,
+    prefs: Option<Prefs>,
+    size: egui::Vec2,
+    tofu: bool,
+    plugin_args: Option<&[&str]>,
+) -> Fixture {
+    use bp_gui::plugins::host::{PluginHost, Timings};
+
     let dir = tempfile::tempdir().unwrap();
+    if let Some(args) = plugin_args {
+        install_plugin(dir.path(), args);
+    }
+    let root = dir.path().to_path_buf();
+    let with_plugins = plugin_args.is_some();
     if let Some(p) = prefs {
         p.save(&dir.path().join("gui.toml")).unwrap();
     }
@@ -233,14 +395,30 @@ pub fn build(
         clock: clock.clone(),
         prefs_path: Some(dir.path().join("gui.toml")),
         thumbs_dir: dir.path().join("thumbs"),
+        playlists_dir: dir.path().join("playlists"),
         pick_folder: Box::new(move || picked.clone()),
+        plugins: None,
+        home: test_home(),
     };
     // Art results arrive from worker threads and each asks for a repaint.
     let mut builder = Harness::builder().with_size(size).with_max_steps(64);
     if tofu {
         builder = builder.allow_missing_glyphs();
     }
-    let harness = builder.build_eframe(move |cc| BpApp::new(&cc.egui_ctx, deps));
+    let harness = builder.build_eframe(move |cc| {
+        let mut deps = deps;
+        if with_plugins {
+            let ctx = cc.egui_ctx.clone();
+            deps.plugins = Some(PluginHost::start(
+                root.join("plugins"),
+                root.join("data").join("plugins.toml"),
+                root.join("logs"),
+                Timings::default(),
+                Arc::new(move || ctx.request_repaint()),
+            ));
+        }
+        BpApp::new(&cc.egui_ctx, deps)
+    });
     Fixture {
         harness,
         lib,
@@ -423,7 +601,10 @@ pub fn engine_fixture() -> EngineFixture {
         clock: Arc::new(SystemClock::new()),
         prefs_path: Some(dir.path().join("gui.toml")),
         thumbs_dir: dir.path().join("thumbs"),
+        playlists_dir: dir.path().join("playlists"),
         pick_folder: Box::new(|| None),
+        plugins: None,
+        home: test_home(),
     };
     let harness = Harness::builder()
         .with_size(egui::vec2(1280.0, 800.0))

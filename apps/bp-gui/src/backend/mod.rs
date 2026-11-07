@@ -100,15 +100,45 @@ pub use bp_engine::DeviceCaps;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayerCommand {
-    Play { items: Vec<QueueItem>, start: usize },
+    Play {
+        items: Vec<QueueItem>,
+        start: usize,
+    },
+    /// Adds to the end of the queue while playing or paused; otherwise plays from the first item.
+    Append {
+        items: Vec<QueueItem>,
+    },
+    /// Plays `items` after the current track (see `bp_engine::Command::Insert`); when stopped, plays them.
+    Insert {
+        items: Vec<QueueItem>,
+    },
+    /// Replaces the queue from `from` on with `items`, if it still holds `expected` there and the
+    /// decoder hasn't taken it (see `bp_engine::Command::Rearrange`). Answered by `Rearranged` or
+    /// `RearrangeRefused`.
+    Rearrange {
+        from: usize,
+        expected: Vec<QueueItem>,
+        items: Vec<QueueItem>,
+    },
     Pause,
     Resume,
     Stop,
     Next,
     Previous,
-    Seek { position: Duration },
-    SelectDevice { id: DeviceId },
-    Reprobe { id: DeviceId },
+    Seek {
+        position: Duration,
+    },
+    SelectDevice {
+        id: DeviceId,
+    },
+    Reprobe {
+        id: DeviceId,
+    },
+    /// Turns DoP on or off for the device (see `bp_engine::Command::SetDop`).
+    SetDop {
+        id: DeviceId,
+        enabled: bool,
+    },
     RefreshDevices,
 }
 

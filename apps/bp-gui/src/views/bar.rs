@@ -14,6 +14,7 @@ use crate::backend::{Album, QueueItem};
 use crate::fmt::{device_label, duration, long_source, short_format};
 use crate::state::now_playing::{Badge, NowPlaying};
 use crate::theme::{TEXT, TEXT_2, TEXT_3, semibold};
+use crate::views::track_list::ON_WHITE;
 use crate::views::{paint_art_rounded, spectrum, text_at, truncated};
 
 /// Height of the controls row, at the window bottom.
@@ -40,7 +41,6 @@ const BUTTON: f32 = 30.0;
 const DISC: f32 = 38.0;
 const SEEK_MAX: f32 = 520.0;
 const TRACK: Color32 = Color32::from_rgb(0x33, 0x33, 0x33);
-const ON_WHITE: Color32 = Color32::from_rgb(0x11, 0x11, 0x11);
 /// The mini spectrum, left of the badge.
 const SPECTRUM_W: f32 = 120.0;
 const SPECTRUM_H: f32 = 30.0;
@@ -51,12 +51,14 @@ pub struct BarData<'a> {
     pub np: &'a NowPlaying,
     /// Player-clock time, for the notice expiry.
     pub now: Duration,
-    /// The album the queue was started from.
+    /// The playing track's album.
     pub album: Option<&'a Album>,
     /// The selected device's name.
     pub device: Option<&'a str>,
     /// Mini spectrum levels while playing.
     pub spectrum: Option<&'a [f32]>,
+    /// The app's own notice and whether it offers Undo; it wins over the player's.
+    pub notice: Option<(&'a str, bool)>,
 }
 
 pub enum BarAction {
@@ -66,6 +68,8 @@ pub enum BarAction {
     Seek(Duration),
     Retry,
     OpenNowPlaying,
+    /// The notice's Undo button.
+    Undo,
 }
 
 pub struct BarOutput {
@@ -251,10 +255,36 @@ pub fn show(ui: &mut Ui, data: &BarData, art: &mut ArtLoader) -> BarOutput {
 
     let line_y = full.top() + 58.0;
     let mono = FontId::monospace(11.0);
-    if let Some(notice) = np.notice_text(data.now) {
-        let g = truncated(ui, notice, FontId::monospace(12.0), TEXT_2, centre.width());
-        let pos = Pos2::new(mid - g.size().x / 2.0, line_y - g.size().y / 2.0);
+    let own = data.notice;
+    if let Some((notice, undo)) = own.or_else(|| np.notice_text(data.now).map(|t| (t, false))) {
+        let undo_w = if undo { 48.0 } else { 0.0 };
+        let g = truncated(
+            ui,
+            notice,
+            FontId::monospace(12.0),
+            TEXT_2,
+            centre.width() - undo_w,
+        );
+        let total = g.size().x + undo_w;
+        let left = mid - total / 2.0;
+        let pos = Pos2::new(left, line_y - g.size().y / 2.0);
+        let text_w = g.size().x;
         text_at(ui, pos, g);
+        if undo {
+            let rect = Rect::from_min_size(
+                Pos2::new(left + text_w + 12.0, line_y - 9.0),
+                vec2(undo_w - 12.0, 18.0),
+            );
+            let resp = ui.interact(rect, ui.scope_id().with("Undo"), Sense::click());
+            resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Undo"));
+            let color = if resp.hovered() { TEXT } else { TEXT_2 };
+            let u = truncated(ui, "Undo", FontId::monospace(12.0), color, rect.width());
+            text_at(ui, Pos2::new(rect.left(), line_y - u.size().y / 2.0), u);
+            controls.push(resp.id);
+            if resp.clicked() {
+                action = Some(BarAction::Undo);
+            }
+        }
     } else if let Some(item) = item {
         let total = np.duration.unwrap_or(item.duration);
         let w = centre.width().min(SEEK_MAX);

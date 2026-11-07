@@ -3,8 +3,10 @@
 pub mod analysis;
 mod control;
 mod decoder;
+pub mod home;
 pub mod negotiate;
 pub mod profile;
+mod queue;
 mod timeline;
 
 use std::path::PathBuf;
@@ -34,6 +36,32 @@ pub enum Command {
         tracks: Vec<PathBuf>,
         start: usize,
     },
+    /// Extends the current track list. Gapless across the boundary when the format matches,
+    /// exactly as within a `Play` list. When stopped or finished, behaves like `Play` from
+    /// the first appended track. Unsupported-on-device tracks are skipped and reported as
+    /// today.
+    Append {
+        tracks: Vec<PathBuf>,
+    },
+    /// Puts `tracks` after the current track, before the rest of the list, unless the decoder
+    /// has already started the next one (see below). Gapless into the first inserted track when
+    /// the format allows, exactly as `Append`. When stopped or finished, behaves like `Play`
+    /// from the first inserted track.
+    ///
+    /// The decoder runs up to 2 s ahead: in the last ~2 s of a track it has started the next
+    /// one, and the tracks go after that one. Several inserts in a row keep their order, each
+    /// after the tracks of the one before, until the decoder moves past those.
+    Insert {
+        tracks: Vec<PathBuf>,
+    },
+    /// Replaces the tracks from `from` on with `tracks`, if they still are `expected` and the
+    /// decoder has not taken any of them. Never restarts playback: the current track, its
+    /// position and the stream are untouched.
+    Rearrange {
+        from: usize,
+        expected: Vec<PathBuf>,
+        tracks: Vec<PathBuf>,
+    },
     Pause,
     Resume,
     Stop,
@@ -59,6 +87,13 @@ pub enum Command {
     /// `Event::Error`.
     Reprobe {
         id: DeviceId,
+    },
+    /// Turns DSD over PCM on or off for the device, saves it and publishes the devices
+    /// (`DevicesChanged`). Applies from the next start of playback (`Play`, a skip or a
+    /// seek); the stream in progress is untouched. Ignored for a device never probed.
+    SetDop {
+        id: DeviceId,
+        enabled: bool,
     },
     /// Lists the devices again and publishes them (`DevicesChanged`). A selected device
     /// that is no longer listed falls back to the system default.
@@ -91,6 +126,21 @@ pub enum Event {
         path: PathBuf,
         reason: UnsupportedReason,
     },
+    /// `Insert` put `count` tracks into the playing queue at index `at`; the tracks from
+    /// `at` on moved down by `count`. Not sent when the insert started playback.
+    Inserted {
+        at: usize,
+        count: usize,
+    },
+    /// `Rearrange` was applied: the tracks from `from` on are its `tracks`.
+    Rearranged {
+        from: usize,
+    },
+    /// `Rearrange` was not applied; the queue is unchanged.
+    RearrangeRefused {
+        from: usize,
+        reason: RearrangeRefusal,
+    },
     Paused,
     Resumed,
     QueueFinished,
@@ -109,6 +159,17 @@ pub enum Event {
     DevicesChanged,
     /// Fatal: playback stops and the device is released.
     Error(EngineError),
+}
+
+/// Why a `Rearrange` was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RearrangeRefusal {
+    /// The decoder has already taken track `from` (or one after it).
+    Started,
+    /// The tracks from `from` on are not `expected`.
+    Changed,
+    /// Nothing is playing.
+    Stopped,
 }
 
 pub struct Engine {

@@ -8,6 +8,8 @@ pub const BAR: Color32 = Color32::from_rgb(0x0E, 0x0E, 0x0E);
 pub const SURFACE: Color32 = Color32::from_rgb(0x1D, 0x1D, 0x1D);
 pub const RAISED: Color32 = Color32::from_rgb(0x23, 0x23, 0x23);
 pub const HOVER: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
+/// Selected rows; brighter than HOVER so selected, hovered and playing differ.
+pub const SELECTED: Color32 = Color32::from_rgb(0x30, 0x30, 0x30);
 pub const BORDER: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x2A);
 pub const TEXT: Color32 = Color32::from_rgb(0xF2, 0xF2, 0xF2);
 pub const TEXT_2: Color32 = Color32::from_rgb(0xA8, 0xA8, 0xA8);

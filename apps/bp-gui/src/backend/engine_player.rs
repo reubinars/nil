@@ -65,6 +65,21 @@ impl PlayerHandle for EnginePlayer {
                 tracks: items.into_iter().map(|i| i.path).collect(),
                 start,
             },
+            PlayerCommand::Append { items } => Command::Append {
+                tracks: items.into_iter().map(|i| i.path).collect(),
+            },
+            PlayerCommand::Insert { items } => Command::Insert {
+                tracks: items.into_iter().map(|i| i.path).collect(),
+            },
+            PlayerCommand::Rearrange {
+                from,
+                expected,
+                items,
+            } => Command::Rearrange {
+                from,
+                expected: expected.into_iter().map(|i| i.path).collect(),
+                tracks: items.into_iter().map(|i| i.path).collect(),
+            },
             PlayerCommand::Pause => Command::Pause,
             PlayerCommand::Resume => Command::Resume,
             PlayerCommand::Stop => Command::Stop,
@@ -73,6 +88,7 @@ impl PlayerHandle for EnginePlayer {
             PlayerCommand::Seek { position } => Command::Seek { position },
             PlayerCommand::SelectDevice { id } => Command::SelectDevice { id },
             PlayerCommand::Reprobe { id } => Command::Reprobe { id },
+            PlayerCommand::SetDop { id, enabled } => Command::SetDop { id, enabled },
             PlayerCommand::RefreshDevices => Command::RefreshDevices,
         };
         self.engine.send(cmd);

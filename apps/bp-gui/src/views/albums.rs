@@ -2,14 +2,15 @@
 //! empty state shown before any music folder is set.
 
 use egui::{
-    Color32, CornerRadius, FontId, Pos2, Rect, Role, Sense, Stroke, StrokeKind, Ui, WidgetInfo,
-    vec2,
+    Color32, CornerRadius, FontId, Popup, Pos2, Rect, Role, Sense, Stroke, StrokeKind, Ui,
+    WidgetInfo, vec2,
 };
 
 use crate::art::{ArtKind, ArtLoader};
 use crate::backend::{Album, AlbumId};
 use crate::fmt::format_tag;
 use crate::theme::{TEXT, TEXT_2, semibold};
+use crate::views::context_menu::{self, MenuAction, MenuPlace, MenuSpec};
 use crate::views::{paint_art_rounded, shadow, text_at, truncated};
 
 /// Space between tiles across.
@@ -36,17 +37,32 @@ pub fn layout(width: f32) -> (usize, f32) {
     (cols, tile.max(1.0))
 }
 
+/// What an album tile reports.
+pub enum TileAction {
+    /// The tile was clicked: open the album.
+    Open(AlbumId),
+    /// A choice was made in the tile's right-click menu.
+    Menu(AlbumId, MenuAction),
+}
+
+/// What an album tile's menu needs.
+#[derive(Clone, Copy)]
+pub struct TileMenu<'a> {
+    pub playlists: &'a [String],
+    pub device_ready: bool,
+}
+
 /// A virtualized grid of `count` tiles `caption` px taller than wide, scrolled to
-/// `restore` if given. `tile` paints item `i` at side `side` and returns whether it was
-/// clicked. Returns the clicked index and the scroll offset.
-pub(crate) fn grid(
+/// `restore` if given. `tile` paints item `i` at side `side` and returns what it
+/// reported, if anything. Returns that and the scroll offset.
+pub(crate) fn grid<T>(
     ui: &mut Ui,
     id: &str,
     count: usize,
     caption: f32,
     restore: Option<f32>,
-    mut tile: impl FnMut(&mut Ui, usize, f32) -> bool,
-) -> (Option<usize>, f32) {
+    mut tile: impl FnMut(&mut Ui, usize, f32) -> Option<T>,
+) -> (Option<T>, f32) {
     let mut clicked = None;
     let (cols, side) = layout(ui.available_width());
     let rows = count.div_ceil(cols);
@@ -63,8 +79,8 @@ pub(crate) fn grid(
         for r in range.filter(|&r| r < rows) {
             ui.horizontal(|ui| {
                 for i in (r * cols)..((r + 1) * cols).min(count) {
-                    if tile(ui, i, side) {
-                        clicked = Some(i);
+                    if let Some(reported) = tile(ui, i, side) {
+                        clicked = Some(reported);
                     }
                 }
             });
@@ -73,25 +89,45 @@ pub(crate) fn grid(
     (clicked, out.state.clamped_offset().y)
 }
 
-/// Shows the album grid; returns the album clicked and the scroll offset.
+/// Shows the album grid; returns what a tile reported and the scroll offset.
 pub fn show(
     ui: &mut Ui,
     albums: &[Album],
     art: &mut ArtLoader,
     restore: Option<f32>,
-) -> (Option<AlbumId>, f32) {
-    let (clicked, scroll) = grid(ui, "grid", albums.len(), CAPTION, restore, |ui, i, side| {
-        tile_widget(ui, &albums[i], art, side)
-    });
-    (clicked.map(|i| albums[i].id), scroll)
+    menu: TileMenu,
+) -> (Option<TileAction>, f32) {
+    grid(ui, "grid", albums.len(), CAPTION, restore, |ui, i, side| {
+        tile_widget(ui, &albums[i], art, side, menu)
+    })
 }
 
-/// One album tile; returns whether it was clicked.
-pub(crate) fn tile_widget(ui: &mut Ui, album: &Album, art: &mut ArtLoader, tile: f32) -> bool {
+/// One album tile; returns a click or a menu choice.
+pub(crate) fn tile_widget(
+    ui: &mut Ui,
+    album: &Album,
+    art: &mut ArtLoader,
+    tile: f32,
+    menu: TileMenu,
+) -> Option<TileAction> {
     let (rect, resp) = ui.allocate_exact_size(vec2(tile, tile + CAPTION), Sense::click());
     resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, &album.title));
+    let spec = MenuSpec {
+        place: MenuPlace::Album,
+        count: 1,
+        playlists: menu.playlists,
+        exclude: None,
+        device_ready: menu.device_ready,
+    };
+    let chosen = Popup::context_menu(&resp)
+        .show(|ui| context_menu::show(ui, &spec))
+        .and_then(|r| r.inner);
+    let reported = match chosen {
+        Some(action) => Some(TileAction::Menu(album.id, action)),
+        None => resp.clicked().then_some(TileAction::Open(album.id)),
+    };
     if !ui.is_rect_visible(rect) {
-        return resp.clicked();
+        return reported;
     }
     let art_rect = Rect::from_min_size(rect.min, vec2(tile, tile));
     let state = art.texture(ui.ctx(), album.id, ArtKind::Thumb);
@@ -144,7 +180,7 @@ pub(crate) fn tile_widget(ui: &mut Ui, album: &Album, art: &mut ArtLoader, tile:
     let p = ui.painter();
     p.galley(Pos2::new(rect.left(), y), title, TEXT);
     p.galley(Pos2::new(rect.left(), y + title_h + 2.0), artist, TEXT_2);
-    resp.clicked()
+    reported
 }
 
 /// The page shown before any music folder is set; returns whether "Add music folder"

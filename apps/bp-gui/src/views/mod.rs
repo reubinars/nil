@@ -2,14 +2,20 @@
 
 pub mod album_page;
 pub mod albums;
+pub mod art_row;
 pub mod artists;
 pub mod bar;
+pub mod context_menu;
 pub mod device_list;
+pub mod name_dialog;
 pub mod now_playing;
+pub mod panel;
+pub mod playlists;
 pub mod search;
 pub mod settings;
 pub mod spectrum;
 pub mod top_bar;
+pub mod track_list;
 pub mod window_controls;
 pub mod wordmark;
 
@@ -23,7 +29,7 @@ use egui::{
 
 use crate::art::ArtState;
 use crate::fmt::initials;
-use crate::theme::TEXT_2;
+use crate::theme::{TEXT, TEXT_2};
 
 const ART_PLACEHOLDER: Color32 = Color32::from_rgb(0x1D, 0x1D, 0x1D);
 
@@ -94,6 +100,50 @@ pub(crate) fn heading(ui: &mut Ui, title: &str, count: Option<&str>) {
             Color32::PLACEHOLDER,
         );
     }
+}
+
+/// An on/off switch with `label` to its right; a click anywhere on it flips `on`.
+/// On: a light track with a dark knob; off: a dark track with a grey knob.
+pub(crate) fn switch(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
+    let track = egui::vec2(30.0, 16.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), FontId::proportional(14.0), TEXT);
+    let gap = 8.0;
+    let size = egui::vec2(
+        track.x + gap + galley.size().x,
+        track.y.max(galley.size().y),
+    );
+    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let checked = *on;
+    resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, ui.is_enabled(), checked, label));
+    if ui.is_rect_visible(rect) {
+        let t = Rect::from_min_size(
+            Pos2::new(rect.left(), rect.center().y - track.y / 2.0),
+            track,
+        );
+        let (fill, knob_fill) = if checked {
+            (TEXT, crate::theme::WINDOW)
+        } else {
+            (crate::theme::HOVER, TEXT_2)
+        };
+        let p = ui.painter();
+        p.rect_filled(t, CornerRadius::same(8), fill);
+        let r = 6.0;
+        let x = if checked {
+            t.right() - 2.0 - r
+        } else {
+            t.left() + 2.0 + r
+        };
+        p.circle_filled(Pos2::new(x, t.center().y), r, knob_fill);
+        let y = rect.center().y - galley.size().y / 2.0;
+        p.galley(Pos2::new(t.right() + gap, y), galley, TEXT);
+    }
+    resp
 }
 
 /// "1 album", "3 albums".

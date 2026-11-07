@@ -93,6 +93,46 @@ fn reprobe_of_another_device_leaves_playback_alone() {
     assert_eq!(caps.caps, dac_a());
 }
 
+#[test]
+fn set_dop_saves_the_setting_and_republishes() {
+    let rig = rig(dac_a());
+    wait_for(&rig.engine, TIMEOUT, |e| matches!(e, Event::DevicesChanged));
+    rig.engine.send(Command::SetDop {
+        id: capture_id(),
+        enabled: true,
+    });
+    wait_for(&rig.engine, TIMEOUT, |e| matches!(e, Event::DevicesChanged));
+    let caps = rig.engine.capabilities(&capture_id()).unwrap();
+    assert_eq!((caps.caps, caps.dop_enabled), (dac_a(), true));
+    let saved = ProfileStore::load(&rig.profile_path).unwrap();
+    assert!(saved.get(&capture_id()).unwrap().dop_enabled);
+
+    rig.engine.send(Command::SetDop {
+        id: capture_id(),
+        enabled: false,
+    });
+    wait_for(&rig.engine, TIMEOUT, |e| matches!(e, Event::DevicesChanged));
+    assert!(!rig.engine.capabilities(&capture_id()).unwrap().dop_enabled);
+    let saved = ProfileStore::load(&rig.profile_path).unwrap();
+    assert!(!saved.get(&capture_id()).unwrap().dop_enabled);
+}
+
+#[test]
+fn set_dop_on_an_unprobed_device_is_ignored() {
+    let (backend, log) = CaptureBackend::new(dac_a());
+    let rig = rig_with(backend, log, &dac_a(), None);
+    wait_for(&rig.engine, TIMEOUT, |e| matches!(e, Event::DevicesChanged));
+    rig.engine.send(Command::SetDop {
+        id: capture_id(),
+        enabled: true,
+    });
+    assert_quiet(&rig.engine, Duration::from_millis(100), |e| {
+        matches!(e, Event::DevicesChanged | Event::Error(_))
+    });
+    assert_eq!(rig.engine.capabilities(&capture_id()), None);
+    assert!(!rig.profile_path.exists());
+}
+
 /// Delegates to a capture backend, but `devices()` takes a while once armed.
 struct SlowList {
     inner: CaptureBackend,

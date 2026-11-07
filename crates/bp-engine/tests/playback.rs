@@ -317,6 +317,43 @@ fn output_error_stops_and_reports() {
 }
 
 #[test]
+fn dsd_plays_over_dop_after_set_dop_turns_it_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsd = vec![pattern(4002, 7), pattern(4002, 8)];
+    let dsf = write_file(dir.path(), "t.dsf", &dsf_bytes(2, 64, &dsd, None));
+    let rig = rig(dac_a());
+    wait_for(&rig.engine, TIMEOUT, |e| matches!(e, Event::DevicesChanged));
+    play(&rig, vec![dsf.clone()], 0);
+    let events = wait_finished(&rig);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::TrackSkipped {
+                reason: UnsupportedReason::DopDisabled,
+                ..
+            }
+        )),
+        "{events:#?}"
+    );
+
+    rig.engine.send(Command::SetDop {
+        id: capture_id(),
+        enabled: true,
+    });
+    wait_for(&rig.engine, TIMEOUT, |e| matches!(e, Event::DevicesChanged));
+    play(&rig, vec![dsf], 0);
+    let events = wait_finished(&rig);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::TrackStarted { playback, .. } if playback.kind == PathKind::Dop
+        )),
+        "{events:#?}"
+    );
+    assert_eq!(rig.log.streams().len(), 1);
+}
+
+#[test]
 fn unsupported_track_skipped_rest_plays() {
     let dir = tempfile::tempdir().unwrap();
     let c = vec![pattern(8192, 1), pattern(8192, 2)];
@@ -768,4 +805,134 @@ fn empty_probe_is_an_error_and_not_saved() {
     );
     assert!(rig.log.streams().is_empty());
     assert!(!rig.profile_path.exists());
+}
+
+const WAV_A: &str = "wav_16_44_a.wav";
+const WAV_B: &str = "wav_16_44_b.wav";
+const TINY: &str = "wav_16_44_tiny.wav";
+
+fn insert(rig: &Rig, tracks: Vec<PathBuf>) -> (usize, usize) {
+    rig.engine.send(Command::Insert { tracks });
+    let events = wait_for(&rig.engine, TIMEOUT, |e| {
+        matches!(e, Event::Inserted { .. })
+    });
+    match events.last() {
+        Some(Event::Inserted { at, count }) => (*at, *count),
+        _ => unreachable!(),
+    }
+}
+
+/// The paths of the `TrackStarted` events, in order.
+fn started_paths(events: &[Event]) -> Vec<PathBuf> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::TrackStarted { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn insert_well_before_the_end_plays_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = long_wav(dir.path(), 5);
+    let rig = rig(only(&[(44_100, "int16/16")]));
+    play_paused(&rig, vec![long, fixture(WAV_B)]);
+    assert_eq!(insert(&rig, vec![fixture(WAV_A)]), (1, 1));
+    rig.engine.send(Command::Resume);
+    let events = wait_finished(&rig);
+    assert!(
+        matches!(events.last(), Some(Event::QueueFinished)),
+        "{events:#?}"
+    );
+    assert_eq!(started(&events), vec![0, 1, 2]);
+    let streams = rig.log.streams();
+    assert_eq!(streams.len(), 1, "gapless into the inserted track");
+    let (b, a) = (data(WAV_B), data(WAV_A));
+    let bytes = &streams[0].bytes;
+    assert!(bytes.ends_with(&b), "the rest of the list plays after it");
+    assert!(
+        bytes[..bytes.len() - b.len()].ends_with(&a),
+        "the inserted track plays right before it"
+    );
+}
+
+#[test]
+fn insert_after_the_decoder_moved_on_goes_later() {
+    let rig = rig(only(&[(44_100, "int16/16")]));
+    play_paused(&rig, vec![fixture(TINY), fixture(WAV_B), fixture(WAV_B)]);
+    // The ring holds all of tiny and b: the decoder is past track 0.
+    std::thread::sleep(Duration::from_millis(300));
+    let (at, count) = insert(&rig, vec![fixture(WAV_A)]);
+    assert!(at >= 2, "after the track the decoder is on, at {at}");
+    assert_eq!(count, 1);
+    rig.engine.send(Command::Resume);
+    let events = wait_finished(&rig);
+    let a = events.iter().find_map(|e| match e {
+        Event::TrackStarted { index, path, .. } if *index == at => Some(path.clone()),
+        _ => None,
+    });
+    assert_eq!(a, Some(fixture(WAV_A)), "{events:#?}");
+}
+
+#[test]
+fn two_inserts_keep_their_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = long_wav(dir.path(), 5);
+    let rig = rig(only(&[(44_100, "int16/16")]));
+    play_paused(&rig, vec![long.clone(), fixture(WAV_B)]);
+    assert_eq!(insert(&rig, vec![fixture(WAV_A)]), (1, 1));
+    assert_eq!(insert(&rig, vec![fixture(TINY)]), (2, 1));
+    rig.engine.send(Command::Resume);
+    let events = wait_finished(&rig);
+    assert_eq!(
+        started_paths(&events),
+        vec![long, fixture(WAV_A), fixture(TINY), fixture(WAV_B)]
+    );
+}
+
+#[test]
+fn insert_while_paused_stays_paused() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = long_wav(dir.path(), 5);
+    let rig = rig(only(&[(44_100, "int16/16")]));
+    play_paused(&rig, vec![long, fixture(WAV_B)]);
+    let bytes = || -> usize { rig.log.streams().iter().map(|s| s.bytes.len()).sum() };
+    let before = bytes();
+    insert(&rig, vec![fixture(WAV_A)]);
+    assert_quiet(&rig.engine, Duration::from_millis(300), |e| {
+        matches!(e, Event::TrackStarted { .. } | Event::Resumed)
+    });
+    assert_eq!(bytes(), before, "nothing played");
+}
+
+#[test]
+fn insert_while_stopped_plays_the_tracks() {
+    let rig = rig(only(&[(44_100, "int16/16")]));
+    rig.engine.send(Command::Insert {
+        tracks: vec![fixture(WAV_A)],
+    });
+    let events = wait_finished(&rig);
+    assert_eq!(started(&events), vec![0]);
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Inserted { .. })),
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn insert_of_an_unplayable_track_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = long_wav(dir.path(), 5);
+    let rig = rig(only(&[(44_100, "int16/16")]));
+    play_paused(&rig, vec![long, fixture(WAV_B)]);
+    assert_eq!(insert(&rig, vec![fixture("wav_24_96.wav")]), (1, 1));
+    rig.engine.send(Command::Resume);
+    let events = wait_finished(&rig);
+    assert_eq!(
+        track_events(&events),
+        vec![("started", 0), ("skipped", 1), ("started", 2)]
+    );
+    assert_eq!(started_paths(&events).last(), Some(&fixture(WAV_B)));
 }

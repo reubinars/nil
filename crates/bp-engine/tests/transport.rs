@@ -1,6 +1,5 @@
 mod common;
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bp_core::{DeviceId, EngineError, OutputError};
@@ -20,14 +19,6 @@ fn last_stream(rig: &Rig) -> CapturedStream {
 
 fn total_bytes(rig: &Rig) -> usize {
     rig.log.streams().iter().map(|s| s.bytes.len()).sum()
-}
-
-/// Plays `tracks` but pauses before the first stream starts, so the test controls exactly
-/// what is played.
-fn play_paused(rig: &Rig, tracks: Vec<PathBuf>) {
-    play(rig, tracks, 0);
-    rig.engine.send(Command::Pause);
-    wait_for(&rig.engine, TIMEOUT, |e| matches!(e, Event::Paused));
 }
 
 /// The index of the last `TrackStarted` in `events`.
@@ -529,4 +520,63 @@ fn spam_round(seed: u64) -> usize {
         shutdown.elapsed()
     );
     streams.len()
+}
+
+#[test]
+fn append_while_playing_is_gapless() {
+    let rig = rig(only(&[(44_100, "int16/16")]));
+    let first = vec![fixture("wav_16_44_a.wav"); 60];
+    play(&rig, first.clone(), 0);
+    wait_for(&rig.engine, TIMEOUT, |e| {
+        matches!(e, Event::TrackStarted { index: 0, .. })
+    });
+    rig.engine.send(Command::Append {
+        tracks: vec![fixture("wav_16_44_b.wav")],
+    });
+    let events = wait_finished(&rig);
+    assert_eq!(started(&events).last(), Some(&60));
+    let streams = rig.log.streams();
+    assert_eq!(streams.len(), 1, "no reopen at the boundary");
+    assert!(streams[0].bytes.ends_with(&data("wav_16_44_b.wav")));
+}
+
+#[test]
+fn append_when_stopped_plays_the_appended_tracks() {
+    let rig = rig(only(&[(44_100, "int16/16")]));
+    rig.engine.send(Command::Append {
+        tracks: vec![fixture("wav_16_44_a.wav")],
+    });
+    let events = wait_finished(&rig);
+    assert_eq!(started(&events), vec![0]);
+}
+
+#[test]
+fn append_after_queue_finished_starts_again() {
+    let rig = rig(only(&[(44_100, "int16/16")]));
+    play(&rig, vec![fixture("wav_16_44_tiny.wav")], 0);
+    wait_finished(&rig);
+    rig.engine.send(Command::Append {
+        tracks: vec![fixture("wav_16_44_b.wav")],
+    });
+    let events = wait_finished(&rig);
+    assert_eq!(started(&events), vec![0]);
+}
+
+#[test]
+fn append_with_a_new_format_reopens_the_stream() {
+    let rig = rig(dac_a());
+    play(&rig, vec![fixture("wav_16_44_a.wav"); 60], 0);
+    wait_for(&rig.engine, TIMEOUT, |e| {
+        matches!(e, Event::TrackStarted { index: 0, .. })
+    });
+    rig.engine.send(Command::Append {
+        tracks: vec![fixture("wav_24_96.wav")],
+    });
+    let events = wait_finished(&rig);
+    assert!(
+        matches!(events.last(), Some(Event::QueueFinished)),
+        "{events:#?}"
+    );
+    assert_eq!(started(&events).last(), Some(&60));
+    assert_eq!(rig.log.streams().len(), 2);
 }
