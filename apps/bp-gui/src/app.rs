@@ -17,6 +17,7 @@ use crate::backend::{
     ScanStatus, Track,
 };
 use crate::catalog::Catalog;
+use crate::media_session::{self, MediaSession, Snapshot};
 use crate::playlists;
 use crate::plugin_bridge::{self, BridgeCtx};
 use crate::plugins::host::{HostEvent, PluginHost, PluginInfo};
@@ -77,6 +78,8 @@ pub struct Deps {
     pub plugins: Option<PluginHost>,
     /// Where nil keeps its files, for Settings.
     pub home: Home,
+    /// nil's entry in Windows' media session; `None` where there is none.
+    pub media: Option<MediaSession>,
 }
 
 /// A modal over the app.
@@ -194,6 +197,7 @@ pub struct BpApp {
     pick_folder: Box<dyn FnMut() -> Option<PathBuf>>,
     plugins: Option<PluginHost>,
     home: Home,
+    media: Option<MediaSession>,
     /// What the host reports, read once per frame. With no host, what
     /// [`BpApp::set_plugin_infos`] set.
     plugin_infos: Vec<PluginInfo>,
@@ -647,6 +651,7 @@ impl BpApp {
             pick_folder: deps.pick_folder,
             plugins: deps.plugins,
             home: deps.home,
+            media: deps.media,
             plugin_infos: Vec::new(),
             plugin_error: None,
             plugin_actions: Vec::new(),
@@ -1044,6 +1049,52 @@ impl BpApp {
         }
     }
 
+    /// Runs the presses from Windows' media session as the bar's buttons would.
+    fn media_presses(&mut self) {
+        let Some(media) = &self.media else { return };
+        for button in media.presses() {
+            if let Some(cmd) = media_session::command(button, &self.now_playing) {
+                self.transport(cmd);
+            }
+        }
+    }
+
+    /// Tells Windows' media session what changed this frame.
+    fn publish_media(&mut self, ctx: &egui::Context) {
+        if self.media.is_none() {
+            return;
+        }
+        let status = media_session::status(&self.now_playing);
+        let track = match status {
+            media_session::Status::Stopped => None,
+            _ => self.media_track(ctx),
+        };
+        let snap = Snapshot {
+            status,
+            track,
+            timeline: media_session::timeline(&self.now_playing),
+        };
+        let now = self.clock.now();
+        if let Some(media) = &mut self.media {
+            media.publish(snap, now);
+        }
+    }
+
+    /// The playing track as the media session shows it.
+    fn media_track(&mut self, ctx: &egui::Context) -> Option<media_session::Track> {
+        let item = self.now_playing.queue.get(self.now_playing.index?)?;
+        let title = item.title.clone();
+        let album = self.playing_track_album();
+        let art = album.as_ref().and_then(|a| self.art.thumb_file(ctx, a.id));
+        let (artist, album) = album.map(|a| (a.artist, a.title)).unwrap_or_default();
+        Some(media_session::Track {
+            title,
+            artist,
+            album,
+            art,
+        })
+    }
+
     /// The whole frame.
     pub fn show(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
@@ -1097,6 +1148,7 @@ impl BpApp {
             self.selection_np = self.now_playing_open;
         }
         self.keyboard(&ctx);
+        self.media_presses();
         let now = std::time::Instant::now();
         let window = self
             .player
@@ -1135,6 +1187,7 @@ impl BpApp {
         self.dialogs(&ctx);
         crate::views::window_controls::resize_edges(&ctx, ctx.content_rect());
         self.announce_player();
+        self.publish_media(&ctx);
 
         self.typing = ctx.text_edit_focused();
         let scanning = matches!(self.scan_status, ScanStatus::Scanning { .. });

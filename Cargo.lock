@@ -605,6 +605,7 @@ dependencies = [
  "lofty",
  "natord",
  "notify",
+ "raw-window-handle",
  "realfft",
  "rfd",
  "serde",

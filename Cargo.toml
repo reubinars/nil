@@ -36,3 +36,4 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 rfd = "0.17.2"
 realfft = "3.4.0"
 notify = "8.2.0"
+raw-window-handle = "0.6.2"

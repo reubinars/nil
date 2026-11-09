@@ -393,6 +393,14 @@ impl ArtLoader {
         ArtState::Loading
     }
 
+    /// The album's cached thumbnail file, once it has loaded; asks for it otherwise.
+    pub fn thumb_file(&mut self, ctx: &egui::Context, album: AlbumId) -> Option<PathBuf> {
+        match self.texture(ctx, album, ArtKind::Thumb) {
+            ArtState::Ready(_) => Some(thumb_path(&self.cache_dir, album)),
+            ArtState::Loading | ArtState::Missing => None,
+        }
+    }
+
     /// The album's cover colours, once its thumbnail has loaded.
     pub fn colors(&self, album: AlbumId) -> Option<AlbumColors> {
         self.colors.get(&album).copied()

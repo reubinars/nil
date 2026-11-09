@@ -36,7 +36,8 @@ notify.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows = { workspace = true, features = ["Foundation", "Media", "Storage", "Storage_Streams", "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging"] }
+raw-window-handle.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

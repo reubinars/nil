@@ -18,8 +18,10 @@ use bp_gui::backend::mock_player::{
     ManualClock, MockDevice, MockPlayer, SystemClock, demo_devices,
 };
 use bp_gui::backend::{LibrarySource, PlayerCommand, QueueItem};
+use bp_gui::media_session::{Button, MediaSession, Update};
 use bp_gui::prefs::Prefs;
 use bp_output::{CaptureBackend, CaptureLog};
+use crossbeam_channel::{Receiver, Sender};
 use egui::{Modifiers, PointerButton, Role};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
@@ -107,6 +109,9 @@ pub struct Fixture {
     pub player: MockPlayer,
     pub clock: Arc<ManualClock>,
     pub dir: TempDir,
+    /// What the app told the media session, and where Windows' presses go in.
+    pub media_updates: Receiver<Update>,
+    pub media_buttons: Sender<Button>,
 }
 
 impl Fixture {
@@ -389,6 +394,8 @@ fn build_with_plugin(
     let lib = Arc::new(MemLibrary::new(tracks, folders));
     let clock = Arc::new(ManualClock::new());
     let player = MockPlayer::new(devices, clock.clone());
+    let (update_tx, media_updates) = crossbeam_channel::unbounded();
+    let (media_buttons, button_rx) = crossbeam_channel::unbounded();
     let deps = Deps {
         player: Box::new(player.clone()),
         library: lib.clone(),
@@ -399,6 +406,7 @@ fn build_with_plugin(
         pick_folder: Box::new(move || picked.clone()),
         plugins: None,
         home: test_home(),
+        media: Some(MediaSession::new(update_tx, button_rx)),
     };
     // Art results arrive from worker threads and each asks for a repaint.
     let mut builder = Harness::builder().with_size(size).with_max_steps(64);
@@ -425,6 +433,8 @@ fn build_with_plugin(
         player,
         clock,
         dir,
+        media_updates,
+        media_buttons,
     }
 }
 
@@ -605,6 +615,7 @@ pub fn engine_fixture() -> EngineFixture {
         pick_folder: Box::new(|| None),
         plugins: None,
         home: test_home(),
+        media: None,
     };
     let harness = Harness::builder()
         .with_size(egui::vec2(1280.0, 800.0))

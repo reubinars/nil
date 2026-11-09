@@ -10,6 +10,7 @@ use bp_gui::app::{BpApp, Deps};
 use bp_gui::backend::PlayerHandle;
 use bp_gui::backend::fs_library::FsLibrary;
 use bp_gui::backend::mock_player::{MockPlayer, SystemClock, demo_devices};
+use bp_gui::media_session::MediaSession;
 use bp_gui::migrate::{Migration, OldDirs, migrate_home};
 use bp_gui::paths::{home, set_home};
 use bp_gui::plugins::host::{PluginHost, Timings};
@@ -76,6 +77,30 @@ fn start_plugins(ctx: &egui::Context) -> PluginHost {
         Timings::default(),
         Arc::new(move || ctx.request_repaint()),
     )
+}
+
+/// Registers the window with Windows' media session; presses wake the UI.
+#[cfg(windows)]
+fn start_media_session(cc: &eframe::CreationContext) -> Option<MediaSession> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let RawWindowHandle::Win32(handle) = cc.window_handle().ok()?.as_raw() else {
+        return None;
+    };
+    let ctx = cc.egui_ctx.clone();
+    let wake = Arc::new(move || ctx.request_repaint());
+    match bp_gui::media_session::smtc::start(handle.hwnd.get(), wake) {
+        Ok(session) => Some(session),
+        Err(e) => {
+            tracing::warn!("no media session: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn start_media_session(_cc: &eframe::CreationContext) -> Option<MediaSession> {
+    None
 }
 
 fn main() -> eframe::Result {
@@ -152,6 +177,7 @@ fn main() -> eframe::Result {
                 pick_folder: Box::new(|| rfd::FileDialog::new().pick_folder()),
                 plugins: Some(start_plugins(&cc.egui_ctx)),
                 home: home().clone(),
+                media: start_media_session(cc),
             };
             Ok(Box::new(BpApp::new(&cc.egui_ctx, deps)))
         }),

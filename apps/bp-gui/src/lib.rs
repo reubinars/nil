@@ -6,6 +6,7 @@ pub mod fmt;
 pub mod icon;
 #[cfg(windows)]
 pub mod instance;
+pub mod media_session;
 pub mod migrate;
 pub mod paths;
 pub mod playlists;

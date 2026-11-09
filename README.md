@@ -18,6 +18,8 @@ Nothing added.
   capability table for your DAC.
 - **Queue and playlists:** edit the upcoming tracks while playing (remove, play next, drag,
   clear, undo), and save or open playlists as standard `.m3u8` files.
+- **Windows media controls:** nil shows its track, cover and position in Windows' media
+  session, so media keys, the volume flyout and apps that follow it can see and control it.
 - **Plugins:** separate programs that add features, each with the permissions you approve and
   optionally its own tab. See [PLUGIN-API.md](PLUGIN-API.md) and the example in
   `examples/plugins/hello`.

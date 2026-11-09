@@ -13,6 +13,7 @@ use bp_gui::backend::mock_player::demo_devices;
 use bp_gui::backend::{
     AlbumId, LibrarySource, PlayerCommand, PlayerEvent, PlayerHandle, ScanStatus,
 };
+use bp_gui::media_session::{self as media, Button, Track, Update};
 use bp_gui::plugins::rpc::{Call, RpcError};
 use bp_gui::prefs::Prefs;
 use bp_gui::state::nav::Page;
@@ -5373,4 +5374,75 @@ fn edit_held_behind_an_insert_ignores_a_stale_insert_answer() {
             "Flamenco Sketches"
         ]
     );
+}
+
+/// The last track the media session was told about.
+fn media_track(updates: &[Update]) -> Option<Track> {
+    updates.iter().rev().find_map(|u| match u {
+        Update::Track(t) => Some(t.clone()),
+        _ => None,
+    })?
+}
+
+#[test]
+fn the_media_session_shows_the_track_and_its_buttons_control_playback() {
+    let mut f = library();
+    f.open_album("Kind of Blue");
+    f.double_click_track("Freddie Freeloader");
+    f.advance(0.4);
+    let updates: Vec<Update> = f.media_updates.try_iter().collect();
+    let track = media_track(&updates).expect("a track");
+    assert_eq!(
+        (
+            track.title.as_str(),
+            track.artist.as_str(),
+            track.album.as_str()
+        ),
+        ("Freddie Freeloader", "Miles Davis", "Kind of Blue")
+    );
+    assert!(updates.contains(&Update::Status(media::Status::Playing)));
+
+    f.media_buttons.send(Button::Pause).unwrap();
+    f.harness.run();
+    assert_eq!(f.last_sent(), Some(PlayerCommand::Pause));
+    assert!(
+        f.media_updates
+            .try_iter()
+            .any(|u| u == Update::Status(media::Status::Paused))
+    );
+
+    f.media_buttons.send(Button::Play).unwrap();
+    f.harness.run();
+    assert_eq!(f.last_sent(), Some(PlayerCommand::Resume));
+
+    f.media_buttons
+        .send(Button::Seek(Duration::from_secs(60)))
+        .unwrap();
+    f.harness.run();
+    assert_eq!(
+        f.last_sent(),
+        Some(PlayerCommand::Seek {
+            position: Duration::from_secs(60)
+        })
+    );
+
+    f.media_buttons.send(Button::Next).unwrap();
+    f.harness.run();
+    assert_eq!(f.last_sent(), Some(PlayerCommand::Next));
+    f.advance(0.4);
+    let updates: Vec<Update> = f.media_updates.try_iter().collect();
+    assert_eq!(
+        media_track(&updates).expect("the next track").title,
+        "Blue in Green"
+    );
+}
+
+#[test]
+fn media_session_presses_with_nothing_loaded_do_nothing() {
+    let mut f = library();
+    for b in [Button::Play, Button::Pause, Button::Next, Button::Previous] {
+        f.media_buttons.send(b).unwrap();
+    }
+    f.harness.run();
+    assert_eq!(f.player.sent(), vec![]);
 }
